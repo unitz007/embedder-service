@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /Users/charles/Personal/Golang/KaelCodex/agent/*.py)",
+      "Bash(python3 -c \":*)",
+      "Bash(python3 -c \"import ast, pathlib; ast.parse\\(pathlib.Path\\(''/Users/charles/Personal/Golang/KaelCodex/agent/task_executor.py''\\).read_text\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(go build:*)",
+      "Bash(npx tsc:*)",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(npm run:*)",
+      "Bash(python3 -c \"import ast, pathlib; ast.parse\\(pathlib.Path\\(''/Users/charles/Personal/Golang/KaelCodex/agent/llm_client.py''\\).read_text\\(\\)\\); print\\(''OK''\\)\")"
+    ]
+  }
+}

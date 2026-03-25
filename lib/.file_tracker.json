@@ -1,0 +1,232 @@
+{
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/tsconfig.node.json": {
+    "mtime": 1772391537.1032703,
+    "hash": "eec85c9d7c6b599801557f1afd86672c",
+    "indexed_at": "2026-03-21T21:32:35.648014"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/vercel.json": {
+    "mtime": 1772890756.7808824,
+    "hash": "6411d2fbb5f0e00aaff0ca0ded84e0b6",
+    "indexed_at": "2026-03-21T21:32:35.648067"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/tsconfig.app.json": {
+    "mtime": 1772391537.1029103,
+    "hash": "06fed9d2d293837c0571529eaae7204a",
+    "indexed_at": "2026-03-21T21:32:35.648130"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/vite.config.js": {
+    "mtime": 1772667037.1249897,
+    "hash": "883403472d2326c3228dd32cdb1bb905",
+    "indexed_at": "2026-03-21T21:32:35.649828"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/package-lock.json": {
+    "mtime": 1772665818.269622,
+    "hash": "78d895b9e9464e801b2b89477f666e9c",
+    "indexed_at": "2026-03-21T21:32:35.652253"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/package.json": {
+    "mtime": 1772665818.2584574,
+    "hash": "a62f38b54f22e2a11a7a3f98c95148f6",
+    "indexed_at": "2026-03-21T21:32:35.652316"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/tsconfig.json": {
+    "mtime": 1772391537.1030393,
+    "hash": "a3d39fa780ebff65444de257f291ce6c",
+    "indexed_at": "2026-03-21T21:32:35.652351"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/eslint.config.js": {
+    "mtime": 1772391537.1006405,
+    "hash": "b8893da386a89dfd3672dad848f4ec7e",
+    "indexed_at": "2026-03-21T21:32:35.652438"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/vite.config.ts": {
+    "mtime": 1773184732.342078,
+    "hash": "905282c0f980b88be2ced07a4d4ed330",
+    "indexed_at": "2026-03-21T21:32:35.652491"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/LoginPage.tsx": {
+    "mtime": 1773184732.2604716,
+    "hash": "fe9362634a9ad47c6e34b4936b275dc4",
+    "indexed_at": "2026-03-21T21:32:35.653184"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/App.tsx": {
+    "mtime": 1773184730.7245324,
+    "hash": "b918344b776b3fa33e410a52f3ee3fad",
+    "indexed_at": "2026-03-21T21:32:35.653254"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/main.tsx": {
+    "mtime": 1773184732.3096743,
+    "hash": "31bd90057b43e1c98b48611f2d7ef4cb",
+    "indexed_at": "2026-03-21T21:32:35.653341"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/DashboardShell.tsx": {
+    "mtime": 1772983385.873623,
+    "hash": "209a27c8659896c4172e43df76aa2809",
+    "indexed_at": "2026-03-21T21:32:35.665755"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/main.jsx": {
+    "mtime": 1772649937.7716827,
+    "hash": "14724477be2644563498d5f69cd1fc92",
+    "indexed_at": "2026-03-21T21:32:35.665819"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/App.jsx": {
+    "mtime": 1772698784.8303053,
+    "hash": "a3507eaecf613604f7b94d7792d6e484",
+    "indexed_at": "2026-03-21T21:32:35.665937"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/utils/helpers.js": {
+    "mtime": 1772649937.7732096,
+    "hash": "6991b5e0d965273f1ae79923b89789dc",
+    "indexed_at": "2026-03-21T21:32:35.665997"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/Dialog.jsx": {
+    "mtime": 1772649937.7698452,
+    "hash": "d92d65f62f149fdf6db0c05c8278d4f2",
+    "indexed_at": "2026-03-21T21:32:35.666125"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/ConnectRepoFlow.jsx": {
+    "mtime": 1772649937.7696304,
+    "hash": "c57aab21832d7ac69ad0682ec47ef8ec",
+    "indexed_at": "2026-03-21T21:32:35.666362"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/DeleteMachineModal.jsx": {
+    "mtime": 1772649937.7697163,
+    "hash": "968b04c5c893c27193fef590a554f6e0",
+    "indexed_at": "2026-03-21T21:32:35.666452"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/StatusBadge.jsx": {
+    "mtime": 1772649937.7711754,
+    "hash": "f6f3acc830b446fa0010fc02d3080dce",
+    "indexed_at": "2026-03-21T21:32:35.666558"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/PolicyPanel.jsx": {
+    "mtime": 1772649937.7706652,
+    "hash": "50d10e8e1797000c29475fb26d7be7a2",
+    "indexed_at": "2026-03-21T21:32:35.667266"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/MachinePanel.jsx": {
+    "mtime": 1772649937.770165,
+    "hash": "d30fbeae5be555ff4cba3fa8c570fb02",
+    "indexed_at": "2026-03-21T21:32:35.667820"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/Toast.jsx": {
+    "mtime": 1772649937.7712388,
+    "hash": "ae01707de543533a17beb04bb31ab90d",
+    "indexed_at": "2026-03-21T21:32:35.667994"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/RegisterPanel.jsx": {
+    "mtime": 1772665595.5602067,
+    "hash": "44761dc6a367e7ab803359170b10f6b9",
+    "indexed_at": "2026-03-21T21:32:35.668660"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/Icon.jsx": {
+    "mtime": 1772649937.770038,
+    "hash": "73eff4a04037e15405ad96ea77a37729",
+    "indexed_at": "2026-03-21T21:32:35.668906"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/DisconnectRepoFlow.jsx": {
+    "mtime": 1772649937.7699444,
+    "hash": "2218c4fc48cb010bb67302983cf2b29a",
+    "indexed_at": "2026-03-21T21:32:35.669158"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/SidebarContent.jsx": {
+    "mtime": 1772649937.7711055,
+    "hash": "2155fe12559b379aa172a08710a34008",
+    "indexed_at": "2026-03-21T21:32:35.669351"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/components/DeletePolicyModal.jsx": {
+    "mtime": 1772649937.7697785,
+    "hash": "2471b4bfd525e05d904ed9d9097be231",
+    "indexed_at": "2026-03-21T21:32:35.669459"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/hooks/usePolicies.js": {
+    "mtime": 1772649937.7714012,
+    "hash": "707ee62f80106bb6cd480e694e7bb8dc",
+    "indexed_at": "2026-03-21T21:32:35.669593"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/hooks/useMachines.jsx": {
+    "mtime": 1772649937.771338,
+    "hash": "d5bbc77b4ea1f11cd862b501f93ee1aa",
+    "indexed_at": "2026-03-21T21:32:35.669797"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/hooks/usePolicyRuns.js": {
+    "mtime": 1772649937.771462,
+    "hash": "6203d3b7d46ad996a4739aeb2ce00daa",
+    "indexed_at": "2026-03-21T21:32:35.669973"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/lib/events.d.ts": {
+    "mtime": 1773184732.2231236,
+    "hash": "6ca844a6356497fd473f4cdb46f7df67",
+    "indexed_at": "2026-03-21T21:32:35.670322"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/lib/api.ts": {
+    "mtime": 1773184732.204523,
+    "hash": "8951996c7be5d50b1a9d769282c94941",
+    "indexed_at": "2026-03-21T21:32:35.670562"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/lib/events.jsx": {
+    "mtime": 1773184732.2375026,
+    "hash": "bfeb2d52097bd850d6a34de1a1838e0e",
+    "indexed_at": "2026-03-21T21:32:35.670863"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/LoginPage.tsx": {
+    "mtime": 1772903316.8711457,
+    "hash": "a6c68aeb63043c91849256f0af861b47",
+    "indexed_at": "2026-03-21T21:32:35.671370"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/SignOutPage.jsx": {
+    "mtime": 1772649937.7728362,
+    "hash": "5e9bd8354624f72bf6586cdc02dd5ae0",
+    "indexed_at": "2026-03-21T21:32:35.671578"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/CompliancePage.jsx": {
+    "mtime": 1772649937.7719703,
+    "hash": "cc25c26910ccd7679987542e53a4fdac",
+    "indexed_at": "2026-03-21T21:32:35.672102"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/MachinesPage.jsx": {
+    "mtime": 1772649937.7722917,
+    "hash": "7f5f1e660297b7cbbb2332e556e149f6",
+    "indexed_at": "2026-03-21T21:32:35.672518"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/RepositoryCallbackPage.jsx": {
+    "mtime": 1772720802.9111779,
+    "hash": "8d4dbb8a8ad92177c495d44ea402666b",
+    "indexed_at": "2026-03-21T21:32:35.672703"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/SettingsPage.jsx": {
+    "mtime": 1772887924.4687707,
+    "hash": "5f3939e2de2e445b9e0860802bb45427",
+    "indexed_at": "2026-03-21T21:32:35.673107"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/MachineDetailPage.jsx": {
+    "mtime": 1772649937.772192,
+    "hash": "ce4fd3c2070c9cadc0f7325cd513d182",
+    "indexed_at": "2026-03-21T21:32:35.673248"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/DashboardShell.jsx": {
+    "mtime": 1772667695.7690246,
+    "hash": "71e45b4ede374725df382907d05bbea3",
+    "indexed_at": "2026-03-21T21:32:35.673528"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/OAuthCallbackPage.jsx": {
+    "mtime": 1772667106.477638,
+    "hash": "bf1e847bbd65c5712f7cbeda914699d5",
+    "indexed_at": "2026-03-21T21:32:35.673708"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/PoliciesPage.jsx": {
+    "mtime": 1772649937.7726047,
+    "hash": "9d69bc92977018dc858b7ae49e40a76f",
+    "indexed_at": "2026-03-21T21:32:35.674190"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/pages/OverviewPage.jsx": {
+    "mtime": 1772649937.7724853,
+    "hash": "ea36603f371b71e24617572a5afda67b",
+    "indexed_at": "2026-03-21T21:32:35.674828"
+  },
+  "/Users/charles/Personal/Golang/Dotfile-Syncer/dotsync/src/services/api.js": {
+    "mtime": 1772890696.1742272,
+    "hash": "192a4dae9f9de6729a56937d39f27ddf",
+    "indexed_at": "2026-03-21T21:32:35.675932"
+  }
+}

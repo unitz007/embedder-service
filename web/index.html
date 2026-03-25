@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codebase Tutorial Generator</title>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap");
+      :root {
+        --bg: #0d0f14;
+        --panel: #151a22;
+        --text: #e7ebf2;
+        --muted: #9aa3b2;
+        --accent: #4ea1ff;
+        --accent-2: #7bdfb0;
+        --danger: #ff6b6b;
+        --border: #242a36;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", system-ui, sans-serif;
+        background:
+          radial-gradient(900px 500px at 10% -10%, #1a2333 0%, transparent 60%),
+          radial-gradient(800px 400px at 90% 0%, #1f2b20 0%, transparent 65%),
+          var(--bg);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 32px auto 48px;
+        padding: 0 20px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+      h1 {
+        font-size: 28px;
+        margin: 0;
+        letter-spacing: 0.2px;
+      }
+      .tag {
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 20px;
+        margin-bottom: 18px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+      input, textarea, button, select {
+        width: 100%;
+        padding: 12px 12px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #0f131b;
+        color: var(--text);
+        font-size: 14px;
+        font-family: inherit;
+      }
+      textarea { min-height: 90px; }
+      button {
+        background: linear-gradient(135deg, var(--accent), #6f7bff);
+        border: none;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button.secondary {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--text);
+      }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; }
+      .row > * { flex: 1; min-width: 200px; }
+      .status {
+        margin-top: 12px;
+        padding: 12px;
+        border-radius: 10px;
+        background: #101521;
+        border: 1px solid var(--border);
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        white-space: pre-wrap;
+      }
+      .muted { color: var(--muted); }
+      .ok { color: var(--accent-2); }
+      .err { color: var(--danger); }
+      .tutorial {
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 13px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+      }
+      .sources {
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 12px;
+        white-space: pre-wrap;
+      }
+      @media (max-width: 720px) {
+        .grid { grid-template-columns: 1fr; }
+        header { flex-direction: column; align-items: flex-start; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div>
+          <h1>Codebase Tutorial Generator</h1>
+          <div class="tag">Uses stored embeddings and Ollama to draft a tutorial</div>
+        </div>
+      </header>
+
+      <div class="panel">
+        <h3>Generate Tutorial</h3>
+        <div class="grid">
+          <div>
+            <label>Namespace</label>
+            <input id="namespace" placeholder="your-namespace" />
+          </div>
+          <div>
+            <label>Project ID</label>
+            <input id="project_id" placeholder="your-project" />
+          </div>
+          <div>
+            <label>Ollama Model (optional)</label>
+            <input id="model" placeholder="llama3.1" />
+          </div>
+          <div>
+            <label>Top K Chunks (optional)</label>
+            <input id="k" placeholder="8" />
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <label>Focus (optional)</label>
+            <textarea id="focus" placeholder="e.g., explain indexing flow and how to extend it"></textarea>
+          </div>
+        </div>
+        <div class="row" style="margin-top: 16px;">
+          <button id="generateBtn">Generate Tutorial</button>
+          <button id="clearBtn" class="secondary">Clear</button>
+        </div>
+        <div id="status" class="status">Ready.</div>
+      </div>
+
+      <div class="panel">
+        <h3>Tutorial</h3>
+        <div id="tutorial" class="tutorial muted">No tutorial yet.</div>
+      </div>
+
+      <div class="panel">
+        <h3>Sources</h3>
+        <div id="sources" class="sources muted">No sources yet.</div>
+      </div>
+    </div>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const tutorialEl = document.getElementById("tutorial");
+      const sourcesEl = document.getElementById("sources");
+
+      function setStatus(msg, cls) {
+        statusEl.textContent = msg;
+        statusEl.className = "status " + (cls || "");
+      }
+
+      function clearAll() {
+        tutorialEl.textContent = "No tutorial yet.";
+        tutorialEl.className = "tutorial muted";
+        sourcesEl.textContent = "No sources yet.";
+        sourcesEl.className = "sources muted";
+        setStatus("Cleared.", "");
+      }
+
+      async function generate() {
+        const namespace = document.getElementById("namespace").value.trim();
+        const project_id = document.getElementById("project_id").value.trim();
+        const focus = document.getElementById("focus").value.trim() || null;
+        const model = document.getElementById("model").value.trim() || null;
+        const k = Number(document.getElementById("k").value || "8");
+
+        if (!namespace || !project_id) {
+          setStatus("Missing required fields: namespace and project_id", "err");
+          return;
+        }
+
+        setStatus("Generating tutorial...");
+        const payload = { namespace, project_id, focus, model, k };
+        const res = await fetch("/tutorial", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          setStatus("Error: " + (data.error || res.status), "err");
+          return;
+        }
+
+        tutorialEl.textContent = data.tutorial || "No tutorial returned.";
+        tutorialEl.className = "tutorial";
+        sourcesEl.textContent = JSON.stringify(data.sources || [], null, 2);
+        sourcesEl.className = "sources";
+        setStatus("Done.", "ok");
+      }
+
+      document.getElementById("generateBtn").addEventListener("click", generate);
+      document.getElementById("clearBtn").addEventListener("click", clearAll);
+    </script>
+  </body>
+</html>
