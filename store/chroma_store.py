@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import chromadb
@@ -37,6 +39,70 @@ try:
     CHROMA_AVAILABLE = True
 except ImportError:
     CHROMA_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Single shared PersistentClient per persist_dir
+# ---------------------------------------------------------------------------
+# chromadb.PersistentClient opens an exclusive SQLite connection. Opening
+# multiple clients to the same path in the same process causes
+# SQLITE_READONLY_DBMOVED (code 1032) when one client writes while another
+# has a stale connection to the same file.  Caching one client per path
+# ensures all ChromaStore instances share a single connection.
+
+_client_lock = threading.Lock()
+_client_cache: Dict[str, chromadb.PersistentClient] = {}
+
+
+def _get_or_create_client(persist_dir: str) -> chromadb.PersistentClient:
+    """Return the cached PersistentClient for *persist_dir*, creating it once."""
+    # Normalise path so "/a/b/" and "/a/b" map to the same key
+    key = str(Path(persist_dir).resolve())
+    with _client_lock:
+        if key not in _client_cache:
+            _client_cache[key] = chromadb.PersistentClient(path=persist_dir)
+        return _client_cache[key]
+
+
+def reset_chroma_dir(persist_dir: str) -> None:
+    """Fully reset a ChromaDB persist directory before a fresh index run.
+
+    Three things must happen in order to avoid SQLITE_READONLY_DBMOVED
+    (ChromaDB InternalError code 1032):
+
+    1. Evict our module-level PersistentClient cache entry for this path so
+       _get_or_create_client() will create a new connection afterward.
+
+    2. Call SharedSystemClient.clear_system_cache() — the *actual* fix.
+       In ChromaDB ≥1.x, PersistentClient() is a plain function, not a
+       class, so chromadb.PersistentClient.clear_system_cache() silently
+       raises AttributeError and does nothing.  The real method lives on
+       SharedSystemClient and zeroes _identifier_to_system, which is the
+       dict that keeps background threads (WAL checkpoint, segment GC, index
+       compaction) alive after our Python reference is dropped.  Without
+       this call those threads keep running, write back into the directory
+       moments after we delete it, and race with the new client's first
+       upsert — producing SQLITE_READONLY_DBMOVED every time.
+
+    3. Delete and recreate the directory so the new PersistentClient opens
+       a brand-new inode with no shared history.
+    """
+    key = str(Path(persist_dir).resolve())
+
+    # Step 1 — evict our cache entry.
+    with _client_lock:
+        _client_cache.pop(key, None)
+
+    # Step 2 — stop ChromaDB's singleton server + background threads.
+    try:
+        from chromadb.api.client import SharedSystemClient
+        SharedSystemClient.clear_system_cache()
+    except Exception:
+        pass
+
+    # Step 3 — fresh directory (new inode, zero stale state).
+    persist_path = Path(persist_dir)
+    shutil.rmtree(persist_path, ignore_errors=True)
+    persist_path.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Metadata serialization helpers
@@ -119,7 +185,7 @@ class ChromaStore:
         self._persist_dir = persist_dir
         Path(persist_dir).mkdir(parents=True, exist_ok=True)
 
-        self._client = chromadb.PersistentClient(path=persist_dir)
+        self._client = _get_or_create_client(persist_dir)
         self._col = self._client.get_or_create_collection(
             name=self._COLLECTION,
             # cosine distance → similarity = 1 − distance
@@ -142,18 +208,63 @@ class ChromaStore:
             self._metadata_cache = [_deserialize(m) for m in metas]
         return self._metadata_cache
 
+    # ChromaDB hard-caps a single upsert at this many items.
+    _UPSERT_BATCH = 5000
+
     def add_vectors(
         self,
         vectors: List[List[float]],
         metadata: List[Dict[str, Any]],
+        replace_all: bool = False,
     ) -> None:
-        """Upsert vectors with their metadata.  Idempotent for unchanged chunks."""
+        """Upsert vectors with their metadata.
+
+        When *replace_all* is True this method provides full-replace semantics
+        without calling delete_collection():
+
+        • delete_collection() internally issues SQLite VACUUM INTO which
+          renames the database file, changing its inode.  Any open connection
+          (including the one that triggered the VACUUM) then gets
+          SQLITE_READONLY_DBMOVED (ChromaDB InternalError code 1032) on the
+          very next write.
+
+        • Instead we upsert all new chunks (idempotent — same chunk_id means
+          same vector is updated in-place) and then delete only the IDs that
+          are in the collection but absent from the new batch.  These are
+          chunks that belonged to files deleted or renamed since the last run.
+          No VACUUM, no file rename, no background-thread race.
+        """
         if not vectors:
+            if replace_all:
+                result = self._col.get(include=[])
+                all_ids = result.get("ids") or []
+                for i in range(0, len(all_ids), self._UPSERT_BATCH):
+                    self._col.delete(ids=all_ids[i : i + self._UPSERT_BATCH])
+                self._metadata_cache = None
             return
+
         ids = [_chunk_id(m) for m in metadata]
         serialized = [_serialize(m) for m in metadata]
-        self._col.upsert(ids=ids, embeddings=vectors, metadatas=serialized)
-        self._metadata_cache = None  # invalidate cache
+
+        for start in range(0, len(ids), self._UPSERT_BATCH):
+            end = start + self._UPSERT_BATCH
+            self._col.upsert(
+                ids=ids[start:end],
+                embeddings=vectors[start:end],
+                metadatas=serialized[start:end],
+            )
+
+        if replace_all:
+            new_id_set = set(ids)
+            result = self._col.get(include=[])
+            existing_ids = result.get("ids") or []
+            stale = [eid for eid in existing_ids if eid not in new_id_set]
+            if stale:
+                for i in range(0, len(stale), self._UPSERT_BATCH):
+                    self._col.delete(ids=stale[i : i + self._UPSERT_BATCH])
+                print(f"Removed {len(stale)} stale vectors from previous index.")
+
+        self._metadata_cache = None
         print(f"Upserted {len(vectors)} vectors. Total: {self.get_total_vectors()}")
 
     def search(
@@ -215,13 +326,9 @@ class ChromaStore:
         return len(ids)
 
     def clear(self) -> None:
-        """
-        Delete the entire collection and recreate it empty.
-
-        Used at the start of a full rebuild so no stale vectors remain from
-        previously indexed files that no longer exist.
-        """
-        self._client.delete_collection(self._COLLECTION)
+        """Wipe all data and reopen a fresh collection on this directory."""
+        reset_chroma_dir(self._persist_dir)
+        self._client = _get_or_create_client(self._persist_dir)
         self._col = self._client.get_or_create_collection(
             name=self._COLLECTION,
             metadata={"hnsw:space": "cosine"},

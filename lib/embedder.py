@@ -1,14 +1,14 @@
 """
-Code embedding using microsoft/codebert-base.
+Code embedding using microsoft/codebert-base (local) or Voyage AI (cloud).
 
-Uses HuggingFace transformers directly with masked mean pooling.
+Local model (CodeBERT):
+• Uses HuggingFace transformers with masked mean pooling
+• Good for small codebases, no external API needed
 
-Fixes included:
-• Avoid HuggingFace network stalls
-• Use local cache after first download
-• GPU acceleration if available
-• Safe tensor device handling
-• Faster batching
+Cloud model (Voyage AI voyage-code-3):
+• Used for large codebases (>LARGE_CODEBASE_THRESHOLD chunks)
+• Requires VOYAGE_API_KEY environment variable
+• 1024-dimensional embeddings optimised for code
 """
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ import logging
 from typing import Any, List, Dict
 
 import numpy as np
+import requests
 import torch
 from transformers import AutoTokenizer, AutoModel
 from sentence_transformers import SentenceTransformer
@@ -37,6 +38,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "microsoft/codebert-base"
 EMBEDDING_DIM = 768
+
+LARGE_CODEBASE_THRESHOLD = 500  # chunks; above this, use cloud embedder
+
+VOYAGE_API_URL = "https://api.voyageai.com/v1/embeddings"
+VOYAGE_MODEL = "voyage-code-3"
+VOYAGE_EMBEDDING_DIM = 1024
+VOYAGE_BATCH_SIZE = 128  # max texts per Voyage AI request
 
 
 # -------------------------------------------------------------------
@@ -314,6 +322,81 @@ class CodeEmbedder:
 
             chunks[i] = updated
 
+        return chunks
+
+
+# -------------------------------------------------------------------
+# Cloud embedder — Voyage AI
+# -------------------------------------------------------------------
+
+class VoyageEmbedder:
+    """Embeds text using the Voyage AI API (voyage-code-3).
+
+    Requires the ``VOYAGE_API_KEY`` environment variable to be set.
+    Suitable for large codebases where local inference is too slow.
+    """
+
+    def __init__(self, api_key: str | None = None, input_type: str = "document"):
+        self.api_key = api_key or os.environ.get("VOYAGE_API_KEY", "")
+        if not self.api_key:
+            raise RuntimeError(
+                "VOYAGE_API_KEY is not set. "
+                "Export it before indexing large codebases."
+            )
+        self.input_type = input_type
+        self._dim = VOYAGE_EMBEDDING_DIM
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def encode(self, texts: List[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self._dim), dtype=np.float32)
+
+        all_embeddings: List[np.ndarray] = []
+
+        for i in range(0, len(texts), VOYAGE_BATCH_SIZE):
+            batch = texts[i : i + VOYAGE_BATCH_SIZE]
+            payload = {
+                "model": VOYAGE_MODEL,
+                "input": batch,
+                "input_type": self.input_type,
+            }
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+            resp = requests.post(
+                VOYAGE_API_URL,
+                json=payload,
+                headers=headers,
+                timeout=120,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"Voyage AI API error {resp.status_code}: {resp.text}"
+                )
+            data = resp.json()["data"]
+            # data is a list of {"index": int, "embedding": List[float]}
+            # sort by index to preserve order
+            ordered = sorted(data, key=lambda x: x["index"])
+            batch_embeddings = np.array(
+                [item["embedding"] for item in ordered], dtype=np.float32
+            )
+            all_embeddings.append(batch_embeddings)
+
+        return np.vstack(all_embeddings)
+
+    def embed_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not chunks:
+            return chunks
+        texts = [c["content"] for c in chunks]
+        embeddings = self.encode(texts)
+        for i, chunk in enumerate(chunks):
+            updated = chunk.copy()
+            updated["embedding"] = embeddings[i].tolist()
+            chunks[i] = updated
         return chunks
 
 

@@ -6,12 +6,22 @@ Symbol Extraction -> Import Graph -> Call Graph -> Code Chunking ->
 Embedding Generation -> Chroma Vector DB -> ContextBuilder (LLM-ready)
 """
 
+import json
 import pickle
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from lib.chunker import chunk_repository_analyses
-from lib.embedder import embed_repository_chunks, CodeEmbedder
+from lib.embedder import (
+    embed_repository_chunks,
+    CodeEmbedder,
+    VoyageEmbedder,
+    LARGE_CODEBASE_THRESHOLD,
+    EMBEDDING_DIM,
+    VOYAGE_EMBEDDING_DIM,
+    VOYAGE_MODEL,
+    DEFAULT_MODEL,
+)
 from lib.graph import (
     build_import_graph, enrich_chunks_with_graph,
     build_call_graph, enrich_chunks_with_call_graph,
@@ -63,14 +73,21 @@ def chunk_analyses(analyses: List[Any]) -> List[Dict[str, Any]]:
 
 
 def generate_embeddings(
-    chunks: List[Dict[str, Any]], model_name: str = "microsoft/codebert-base"
+    chunks: List[Dict[str, Any]],
+    model_name: str = "microsoft/codebert-base",
+    embedder=None,
 ) -> List[Dict[str, Any]]:
     """
     Step 7: Embedding Generation
+
+    If ``embedder`` is provided it is used directly; otherwise a local
+    CodeEmbedder is instantiated from ``model_name``.
+
     Returns: List of chunks with embeddings added
     """
-    embedded = embed_repository_chunks(chunks, model_name)
-    return embedded
+    if embedder is not None:
+        return embedder.embed_chunks(chunks)
+    return embed_repository_chunks(chunks, model_name)
 
 
 def search_code(
@@ -165,18 +182,37 @@ def full_pipeline_chroma(
     chunks = enrich_chunks_with_graph(chunks, import_graph)
     chunks = enrich_chunks_with_call_graph(chunks, call_graph)
 
-    # Step 7: Embeddings
-    chunks_with_embeddings = generate_embeddings(chunks, model_name)
+    # Step 7: Embeddings — pick cloud or local based on codebase size
+    if len(chunks) > LARGE_CODEBASE_THRESHOLD:
+        print(
+            f"Step 7: {len(chunks)} chunks exceeds threshold "
+            f"({LARGE_CODEBASE_THRESHOLD}). Using Voyage AI cloud embedder..."
+        )
+        embedder = VoyageEmbedder()
+    else:
+        print(
+            f"Step 7: {len(chunks)} chunks. Using local CodeBERT embedder..."
+        )
+        embedder = CodeEmbedder(model_name)
 
-    # Step 8: Store in Chroma (clear first — no stale vectors)
+    chunks_with_embeddings = generate_embeddings(chunks, embedder=embedder)
+
+    # Step 8: Store in Chroma.
+    # We use add_vectors(replace_all=True) instead of clear() + add_vectors().
+    # clear() calls delete_collection() which triggers SQLite VACUUM INTO,
+    # renaming the database file and causing SQLITE_READONLY_DBMOVED
+    # (ChromaDB InternalError 1032) on every subsequent write — including
+    # the write that triggered it.  replace_all upserts new chunks in-place
+    # and removes only stale IDs, touching nothing at the file level.
     print("Step 8: Storing in Chroma vector database...")
     store = ChromaStore(chroma_dir)
-    store.clear()
 
     if chunks_with_embeddings:
         embeddings = [c["embedding"] for c in chunks_with_embeddings]
         metadata  = [c["metadata"]  for c in chunks_with_embeddings]
-        store.add_vectors(embeddings, metadata)
+        store.add_vectors(embeddings, metadata, replace_all=True)
+    else:
+        store.add_vectors([], [], replace_all=True)
 
     # Persist graphs alongside the Chroma dir (same prefix as FAISS path so
     # ContextBuilder.load_from_chroma() and load_from_disk() share them).
@@ -187,6 +223,21 @@ def full_pipeline_chroma(
         pickle.dump(import_graph, f)
     print(f"Graphs saved → {graphs_prefix}_call_graph.pkl / ..._import_graph.pkl")
 
+    # Write index metadata so callers know which embedding model was used.
+    # This prevents dimension mismatches at query time when the codebase size
+    # crosses the local/cloud threshold between runs.
+    is_cloud = isinstance(embedder, VoyageEmbedder)
+    index_meta = {
+        "embedder": type(embedder).__name__,
+        "model": VOYAGE_MODEL if is_cloud else model_name,
+        "embedding_dim": VOYAGE_EMBEDDING_DIM if is_cloud else EMBEDDING_DIM,
+        "use_cloud": is_cloud,
+    }
+    meta_path = Path(chroma_dir) / "index_meta.json"
+    with open(meta_path, "w") as f:
+        json.dump(index_meta, f, indent=2)
+    print(f"Index metadata saved → {meta_path}")
+
     print("=" * 50)
     print("Chroma pipeline completed!")
-    return store, call_graph, import_graph
+    return store, call_graph, import_graph, type(embedder).__name__
