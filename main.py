@@ -9,7 +9,7 @@ from uuid import uuid4
 from typing import List, Optional
 
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Form
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Form, Request, HTTPException
 from pydantic import BaseModel, Field
 import requests
 
@@ -25,7 +25,6 @@ app = FastAPI()
 CHROMA_BASE_DIR = os.getenv("CHROMA_DIR") or os.path.abspath(os.path.join(os.getcwd(), "chroma_data"))
 GITHUB_API_BASE = os.getenv("GITHUB_API_BASE", "https://api.github.com")
 GITHUB_API_VERSION = os.getenv("GITHUB_API_VERSION", "2022-11-28")
-GITHUB_PAT = os.getenv("GITHUB_PAT", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
 
@@ -86,6 +85,14 @@ class GitHubIndexRequest(BaseModel):
     namespace: Optional[str] = None
     project_id: Optional[str] = None
     webhook_url: Optional[str] = None
+    access_token: Optional[str] = Field(None, description="OAuth2 access token for GitHub")
+
+
+def _require_bearer_token(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization: Bearer token")
+    return auth.split(" ", 1)[1].strip()
 
 
 
@@ -139,10 +146,12 @@ def _notify_webhook(job: dict) -> None:
         print(f"Webhook notify failed: {e}")
 
 
-def _require_pat() -> str:
-    if not GITHUB_PAT:
-        raise RuntimeError("GITHUB_PAT is not set")
-    return GITHUB_PAT
+def _resolve_github_token(req_token: Optional[str], auth_header: Optional[str]) -> str:
+    if req_token:
+        return req_token
+    if auth_header and auth_header.lower().startswith("bearer "):
+        return auth_header.split(" ", 1)[1].strip()
+    raise HTTPException(status_code=401, detail="Missing GitHub OAuth token (access_token or Authorization header)")
 
 
 def _github_download_zip(pat: str, owner: str, repo: str, ref: Optional[str], zip_path: str) -> None:
@@ -162,6 +171,19 @@ def _github_download_zip(pat: str, owner: str, repo: str, ref: Optional[str], zi
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+
+
+def _github_validate_access(token: str, owner: str, repo: str) -> None:
+    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    }
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code == 200:
+        return
+    raise HTTPException(status_code=resp.status_code, detail=f"GitHub auth failed: {resp.text}")
 
 
 
@@ -221,12 +243,14 @@ def read_root():
 
 @app.post("/embeddings/{namespace}/{project_id}")
 async def post_embeddings(
+        request: Request,
         namespace: str,
         project_id: str,
         background_tasks: BackgroundTasks,
         code_zip: UploadFile = File(...),
         webhook_url: Optional[str] = Form(None),
 ):
+    _require_bearer_token(request)
     temp_dir = f"/tmp/{namespace}/{project_id}"
     os.makedirs(temp_dir, exist_ok=True)
 
@@ -246,7 +270,8 @@ async def post_embeddings(
     }
 
 @app.get("/jobs/{job_id}")
-def get_job(job_id: str):
+def get_job(job_id: str, request: Request):
+    _require_bearer_token(request)
     job = JOBS.get(job_id)
     if not job:
         return {"error": "job not found"}
@@ -277,7 +302,8 @@ def delete_embeddings(namespace: str, project_id: str):
 
 
 @app.get("/embeddings/{namespace}/{project_id}")
-def get_embeddings(namespace: str, project_id: str):
+def get_embeddings(namespace: str, project_id: str, request: Request):
+    _require_bearer_token(request)
     persist_dir = os.path.join(CHROMA_BASE_DIR, namespace, project_id)
     if not os.path.exists(persist_dir):
         return {"error": "index not found", "namespace": namespace, "project_id": project_id}
@@ -293,7 +319,8 @@ def get_embeddings(namespace: str, project_id: str):
 
 
 @app.post("/search")
-def search_embeddings(req: SearchRequest):
+def search_embeddings(req: SearchRequest, request: Request):
+    _require_bearer_token(request)
     persist_dir = os.path.join(CHROMA_BASE_DIR, req.namespace, req.project_id)
     if not os.path.exists(persist_dir):
         return {"error": "index not found", "namespace": req.namespace, "project_id": req.project_id}
@@ -345,7 +372,8 @@ def search_embeddings(req: SearchRequest):
 
 
 @app.post("/search/text")
-def search_by_text(req: TextSearchRequest):
+def search_by_text(req: TextSearchRequest, request: Request):
+    _require_bearer_token(request)
     """Search using raw query text — the server picks the correct embedding model
     automatically by reading the index metadata. No pre-computed embedding needed."""
     if not req.query.strip():
@@ -383,7 +411,8 @@ def search_by_text(req: TextSearchRequest):
 
 
 @app.post("/embed")
-def embed_text(req: EmbedRequest):
+def embed_text(req: EmbedRequest, request: Request):
+    _require_bearer_token(request)
     if not req.text.strip():
         return {"error": "text is empty"}
 
@@ -407,7 +436,9 @@ def embed_text(req: EmbedRequest):
 
 
 @app.post("/github/index")
-def github_index(req: GitHubIndexRequest, background_tasks: BackgroundTasks):
+def github_index(req: GitHubIndexRequest, background_tasks: BackgroundTasks, request: Request):
+    token = _resolve_github_token(req.access_token, request.headers.get("authorization"))
+    _github_validate_access(token, req.owner, req.repo)
     namespace = req.namespace or req.owner
     project_id = req.project_id or req.repo
 
@@ -423,8 +454,7 @@ def github_index(req: GitHubIndexRequest, background_tasks: BackgroundTasks):
     def _download_and_process():
         try:
             _job_update(job_id, status="downloading")
-            pat = _require_pat()
-            _github_download_zip(pat, req.owner, req.repo, req.ref, zip_path)
+            _github_download_zip(token, req.owner, req.repo, req.ref, zip_path)
             process_zip(temp_dir, zip_path, namespace, project_id, job_id)
         except Exception as e:
             _job_update(job_id, status="failed", error=str(e))
@@ -440,4 +470,4 @@ def github_index(req: GitHubIndexRequest, background_tasks: BackgroundTasks):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", reload=False)
+    uvicorn.run("main:app", reload=True)

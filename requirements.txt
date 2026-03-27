@@ -2,6 +2,13 @@ requests>=2.31.0
 
 tree-sitter
 tree-sitter-javascript
+tree-sitter-rust
+tree-sitter-bash
+tree-sitter-c
+tree-sitter-cpp
+tree-sitter-zsh
+tree-sitter-c-sharp
+tree-sitter-java
 chromadb
 tree-sitter-go
 numpy
