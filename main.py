@@ -17,6 +17,7 @@ from pathlib import Path
 
 from indexing.full_pipeline import full_pipeline_chroma
 from store.chroma_store import ChromaStore, reset_chroma_dir
+from store.project_store import ProjectStore
 from lib.embedder import CodeEmbedder, VoyageEmbedder, DEFAULT_MODEL
 
 app = FastAPI()
