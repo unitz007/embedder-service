@@ -1,24 +1,37 @@
-requests>=2.31.0
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0.0
+python-multipart>=0.0.9
 
-tree-sitter
+# HTTP / auth
+requests>=2.31.0
+PyJWT>=2.8.0
+cryptography>=42.0.0
+
+# Embeddings
+# torch is installed separately by deploy.sh using the PyTorch CPU wheel index
+# numpy must be <2.0 — torch 2.2.x is incompatible with numpy 2
+numpy>=1.26.0,<2.0.0
+sentence-transformers>=2.7.0
+transformers>=4.40.0
+
+# Database
+psycopg2-binary>=2.9.9
+
+# Vector store
+chromadb>=1.5.5
+
+# Code analysis — tree-sitter grammars
+# Note: grammar packages have inconsistent versioning; no version pins to avoid conflicts
+tree-sitter>=0.23.0
+tree-sitter-go
 tree-sitter-javascript
 tree-sitter-rust
-tree-sitter-bash
+tree-sitter-java
+tree-sitter-ruby
 tree-sitter-c
 tree-sitter-cpp
-tree-sitter-zsh
+tree-sitter-lua
+tree-sitter-bash
 tree-sitter-c-sharp
-tree-sitter-java
-chromadb
-tree-sitter-go
-numpy
-torch
-transformers
-sentence-transformers
-PyJWT
-cryptography
-fastapi
-python-multipart
-
-uvicorn
-pydantic

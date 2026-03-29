@@ -1,228 +1,722 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Codebase Tutorial Generator</title>
-    <style>
-      @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap");
-      :root {
-        --bg: #0d0f14;
-        --panel: #151a22;
-        --text: #e7ebf2;
-        --muted: #9aa3b2;
-        --accent: #4ea1ff;
-        --accent-2: #7bdfb0;
-        --danger: #ff6b6b;
-        --border: #242a36;
-      }
-      * { box-sizing: border-box; }
-      body {
-        margin: 0;
-        font-family: "Space Grotesk", system-ui, sans-serif;
-        background:
-          radial-gradient(900px 500px at 10% -10%, #1a2333 0%, transparent 60%),
-          radial-gradient(800px 400px at 90% 0%, #1f2b20 0%, transparent 65%),
-          var(--bg);
-        color: var(--text);
-      }
-      .wrap {
-        max-width: 980px;
-        margin: 32px auto 48px;
-        padding: 0 20px;
-      }
-      header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 16px;
-        margin-bottom: 18px;
-      }
-      h1 {
-        font-size: 28px;
-        margin: 0;
-        letter-spacing: 0.2px;
-      }
-      .tag {
-        color: var(--muted);
-        font-size: 14px;
-      }
-      .panel {
-        background: var(--panel);
-        border: 1px solid var(--border);
-        border-radius: 14px;
-        padding: 20px;
-        margin-bottom: 18px;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.25);
-      }
-      .grid {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 16px;
-      }
-      label {
-        display: block;
-        font-size: 12px;
-        color: var(--muted);
-        margin-bottom: 6px;
-      }
-      input, textarea, button, select {
-        width: 100%;
-        padding: 12px 12px;
-        border-radius: 10px;
-        border: 1px solid var(--border);
-        background: #0f131b;
-        color: var(--text);
-        font-size: 14px;
-        font-family: inherit;
-      }
-      textarea { min-height: 90px; }
-      button {
-        background: linear-gradient(135deg, var(--accent), #6f7bff);
-        border: none;
-        cursor: pointer;
-        font-weight: 600;
-      }
-      button.secondary {
-        background: transparent;
-        border: 1px solid var(--border);
-        color: var(--text);
-      }
-      .row { display: flex; gap: 12px; flex-wrap: wrap; }
-      .row > * { flex: 1; min-width: 200px; }
-      .status {
-        margin-top: 12px;
-        padding: 12px;
-        border-radius: 10px;
-        background: #101521;
-        border: 1px solid var(--border);
-        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 12px;
-        white-space: pre-wrap;
-      }
-      .muted { color: var(--muted); }
-      .ok { color: var(--accent-2); }
-      .err { color: var(--danger); }
-      .tutorial {
-        font-family: "JetBrains Mono", ui-monospace, monospace;
-        font-size: 13px;
-        line-height: 1.5;
-        white-space: pre-wrap;
-      }
-      .sources {
-        font-family: "JetBrains Mono", ui-monospace, monospace;
-        font-size: 12px;
-        white-space: pre-wrap;
-      }
-      @media (max-width: 720px) {
-        .grid { grid-template-columns: 1fr; }
-        header { flex-direction: column; align-items: flex-start; }
-      }
-    </style>
-  </head>
-  <body>
-    <div class="wrap">
-      <header>
-        <div>
-          <h1>Codebase Tutorial Generator</h1>
-          <div class="tag">Uses stored embeddings and Ollama to draft a tutorial</div>
-        </div>
-      </header>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Indexer Service</title>
+  <style>
+    @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
 
-      <div class="panel">
-        <h3>Generate Tutorial</h3>
-        <div class="grid">
-          <div>
-            <label>Namespace</label>
-            <input id="namespace" placeholder="your-namespace" />
-          </div>
-          <div>
-            <label>Project ID</label>
-            <input id="project_id" placeholder="your-project" />
-          </div>
-          <div>
-            <label>Ollama Model (optional)</label>
-            <input id="model" placeholder="llama3.1" />
-          </div>
-          <div>
-            <label>Top K Chunks (optional)</label>
-            <input id="k" placeholder="8" />
-          </div>
-          <div style="grid-column: 1 / -1;">
-            <label>Focus (optional)</label>
-            <textarea id="focus" placeholder="e.g., explain indexing flow and how to extend it"></textarea>
-          </div>
-        </div>
-        <div class="row" style="margin-top: 16px;">
-          <button id="generateBtn">Generate Tutorial</button>
-          <button id="clearBtn" class="secondary">Clear</button>
-        </div>
-        <div id="status" class="status">Ready.</div>
+    :root {
+      --bg: #0d0f14;
+      --panel: #13171f;
+      --panel-hover: #161c26;
+      --text: #e7ebf2;
+      --muted: #7a8494;
+      --subtle: #3a4252;
+      --accent: #4ea1ff;
+      --accent-dim: rgba(78,161,255,0.12);
+      --green: #3ecf8e;
+      --green-dim: rgba(62,207,142,0.12);
+      --orange: #f5a623;
+      --orange-dim: rgba(245,166,35,0.12);
+      --red: #ff5c5c;
+      --red-dim: rgba(255,92,92,0.12);
+      --purple: #b57cff;
+      --purple-dim: rgba(181,124,255,0.12);
+      --border: #1f2635;
+      --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Space Grotesk", system-ui, sans-serif;
+      background:
+        radial-gradient(ellipse 900px 500px at 15% -5%, #192033 0%, transparent 55%),
+        radial-gradient(ellipse 700px 400px at 85% 5%, #1b2b1e 0%, transparent 55%),
+        var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Layout ── */
+    .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px 80px; }
+
+    /* ── Hero ── */
+    .hero {
+      padding: 72px 0 56px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 56px;
+    }
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--accent-dim);
+      border: 1px solid rgba(78,161,255,0.25);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      padding: 4px 12px;
+      border-radius: 20px;
+      margin-bottom: 20px;
+    }
+    .hero h1 {
+      font-size: clamp(32px, 5vw, 52px);
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      line-height: 1.15;
+      margin-bottom: 18px;
+    }
+    .hero h1 span { color: var(--accent); }
+    .hero p {
+      font-size: 17px;
+      color: var(--muted);
+      max-width: 580px;
+      margin-bottom: 32px;
+    }
+    .hero-chips { display: flex; flex-wrap: wrap; gap: 10px; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .chip .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+    }
+    .chip .dot.blue { background: var(--accent); }
+    .chip .dot.orange { background: var(--orange); }
+
+    /* ── Section title ── */
+    .section-title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 16px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* ── Endpoint group ── */
+    .group { margin-bottom: 40px; }
+    .group-label {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    /* ── Endpoint card ── */
+    .endpoint {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 8px;
+      overflow: hidden;
+      transition: border-color 0.15s;
+    }
+    .endpoint:hover { border-color: var(--subtle); }
+    .endpoint.open { border-color: var(--subtle); }
+
+    .endpoint-header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 14px 18px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .method {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      padding: 3px 9px;
+      border-radius: 5px;
+      min-width: 52px;
+      text-align: center;
+      flex-shrink: 0;
+    }
+    .method.get    { background: var(--green-dim);  color: var(--green);  border: 1px solid rgba(62,207,142,0.3); }
+    .method.post   { background: var(--accent-dim); color: var(--accent); border: 1px solid rgba(78,161,255,0.3); }
+    .method.delete { background: var(--red-dim);    color: var(--red);    border: 1px solid rgba(255,92,92,0.3); }
+
+    .endpoint-path {
+      font-family: var(--mono);
+      font-size: 14px;
+      color: var(--text);
+      flex: 1;
+    }
+    .endpoint-path .param { color: var(--orange); }
+
+    .endpoint-desc {
+      font-size: 13px;
+      color: var(--muted);
+      flex: 2;
+      text-align: right;
+    }
+    .chevron {
+      color: var(--muted);
+      font-size: 12px;
+      transition: transform 0.2s;
+      flex-shrink: 0;
+    }
+    .open .chevron { transform: rotate(180deg); }
+
+    /* ── Endpoint body ── */
+    .endpoint-body {
+      display: none;
+      padding: 0 18px 18px;
+      border-top: 1px solid var(--border);
+    }
+    .open .endpoint-body { display: block; }
+
+    .body-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 16px;
+    }
+    @media (max-width: 680px) {
+      .body-grid { grid-template-columns: 1fr; }
+      .endpoint-desc { display: none; }
+    }
+
+    .body-section h4 {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    pre {
+      background: #0b0e15;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.6;
+      overflow-x: auto;
+      color: #c9d1e0;
+      white-space: pre;
+    }
+
+    /* JSON syntax highlight */
+    .s { color: #89d185; }   /* string value */
+    .k { color: #9cdcfe; }   /* key */
+    .n { color: #b5cea8; }   /* number/bool */
+    .c { color: var(--muted); font-style: italic; } /* comment */
+
+    .params-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .params-table th {
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .params-table td {
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .params-table tr:last-child td { border-bottom: none; }
+    .param-name { font-family: var(--mono); font-size: 12px; color: var(--orange); }
+    .param-type { font-family: var(--mono); font-size: 11px; color: var(--purple); }
+    .param-req  { font-size: 11px; color: var(--red); font-weight: 600; }
+    .param-opt  { font-size: 11px; color: var(--muted); }
+    .param-desc { color: var(--muted); font-size: 12px; }
+
+    .auth-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: var(--orange-dim);
+      color: var(--orange);
+      border: 1px solid rgba(245,166,35,0.25);
+      margin-left: 8px;
+      vertical-align: middle;
+    }
+    .open-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: var(--green-dim);
+      color: var(--green);
+      border: 1px solid rgba(62,207,142,0.25);
+      margin-left: 8px;
+      vertical-align: middle;
+    }
+
+    /* ── Base URL bar ── */
+    .base-url-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-bottom: 40px;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+    .base-url-bar .label { color: var(--muted); font-size: 11px; font-family: inherit; }
+    .base-url-bar .url { color: var(--accent); flex: 1; }
+    .copy-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .copy-btn:hover { color: var(--text); border-color: var(--subtle); }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ── Hero ── -->
+  <section class="hero">
+    <div class="hero-badge">&#x2728; REST API</div>
+    <h1>Code <span>Indexer</span> Service</h1>
+    <p>
+      Semantic search infrastructure for codebases. Index any GitHub repository or local project,
+      generate embeddings with CodeBERT or Voyage AI, and query with natural language.
+    </p>
+    <div class="hero-chips">
+      <div class="chip"><span class="dot"></span> pgvector storage</div>
+      <div class="chip"><span class="dot blue"></span> Voyage AI (cloud, large repos)</div>
+      <div class="chip"><span class="dot orange"></span> CodeBERT (local, small repos)</div>
+    </div>
+  </section>
+
+  <!-- ── Base URL ── -->
+  <div class="base-url-bar">
+    <span class="label">BASE URL</span>
+    <span class="url" id="baseUrl">http://localhost:8080</span>
+    <button class="copy-btn" onclick="copyBase()">Copy</button>
+  </div>
+
+  <!-- ════════════════════════════════ ENDPOINTS ════════════════════════════════ -->
+
+  <!-- ── Indexing ── -->
+  <div class="group">
+    <div class="section-title">Endpoints</div>
+    <div class="group-label">Indexing</div>
+
+    <!-- POST /github/index -->
+    <div class="endpoint" id="ep-github-index">
+      <div class="endpoint-header" onclick="toggle('ep-github-index')">
+        <span class="method post">POST</span>
+        <span class="endpoint-path">/github/index</span>
+        <span class="endpoint-desc">Index a GitHub repo or local path</span>
+        <span class="chevron">▼</span>
       </div>
-
-      <div class="panel">
-        <h3>Tutorial</h3>
-        <div id="tutorial" class="tutorial muted">No tutorial yet.</div>
-      </div>
-
-      <div class="panel">
-        <h3>Sources</h3>
-        <div id="sources" class="sources muted">No sources yet.</div>
+      <div class="endpoint-body">
+        <p style="font-size:13px;color:var(--muted);margin-top:12px;">
+          Queues an indexing job. Accepts a GitHub <code style="font-family:var(--mono);color:var(--orange)">owner/repo</code> (public repos need no token)
+          or an absolute server-side <code style="font-family:var(--mono);color:var(--orange)">path</code>.
+          Automatically selects Voyage AI for repos &gt; 500 chunks, CodeBERT otherwise.
+          <span class="open-badge">&#x1F513; no auth required</span>
+        </p>
+        <div class="body-grid">
+          <div class="body-section">
+            <h4>Request body</h4>
+            <table class="params-table">
+              <tr><th>Field</th><th>Type</th><th></th><th>Description</th></tr>
+              <tr><td class="param-name">owner</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">GitHub owner/org</td></tr>
+              <tr><td class="param-name">repo</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">GitHub repo name</td></tr>
+              <tr><td class="param-name">ref</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">Branch, tag, or commit SHA</td></tr>
+              <tr><td class="param-name">path</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">Absolute local directory path (alternative to owner/repo)</td></tr>
+              <tr><td class="param-name">namespace</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">Storage namespace (defaults to owner)</td></tr>
+              <tr><td class="param-name">project_id</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">Project identifier (defaults to repo)</td></tr>
+              <tr><td class="param-name">access_token</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">GitHub OAuth token — required for private repos</td></tr>
+              <tr><td class="param-name">webhook_url</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">URL to POST job status updates to</td></tr>
+            </table>
+          </div>
+          <div class="body-section">
+            <h4>Example — public GitHub repo</h4>
+            <pre>{
+  <span class="k">"owner"</span>: <span class="s">"vercel"</span>,
+  <span class="k">"repo"</span>:  <span class="s">"next.js"</span>
+}</pre>
+            <h4 style="margin-top:14px;">Example — local path</h4>
+            <pre>{
+  <span class="k">"path"</span>:       <span class="s">"/opt/repos/my-service"</span>,
+  <span class="k">"namespace"</span>:  <span class="s">"acme"</span>,
+  <span class="k">"project_id"</span>: <span class="s">"my-service"</span>
+}</pre>
+            <h4 style="margin-top:14px;">Response</h4>
+            <pre>{
+  <span class="k">"status"</span>:     <span class="s">"queued"</span>,
+  <span class="k">"job_id"</span>:     <span class="s">"a3f9c1..."</span>,
+  <span class="k">"namespace"</span>:  <span class="s">"vercel"</span>,
+  <span class="k">"project_id"</span>: <span class="s">"next.js"</span>
+}</pre>
+          </div>
+        </div>
       </div>
     </div>
 
-    <script>
-      const statusEl = document.getElementById("status");
-      const tutorialEl = document.getElementById("tutorial");
-      const sourcesEl = document.getElementById("sources");
+    <!-- POST /embeddings/{namespace}/{project_id} -->
+    <div class="endpoint" id="ep-upload">
+      <div class="endpoint-header" onclick="toggle('ep-upload')">
+        <span class="method post">POST</span>
+        <span class="endpoint-path">/embeddings/<span class="param">{namespace}</span>/<span class="param">{project_id}</span></span>
+        <span class="endpoint-desc">Upload a zip and index it</span>
+        <span class="chevron">▼</span>
+      </div>
+      <div class="endpoint-body">
+        <p style="font-size:13px;color:var(--muted);margin-top:12px;">
+          Accepts a <code style="font-family:var(--mono);color:var(--accent)">multipart/form-data</code> upload of a zipped repository.
+          <span class="auth-badge">&#x1F512; Bearer token required</span>
+        </p>
+        <div class="body-grid">
+          <div class="body-section">
+            <h4>Form fields</h4>
+            <table class="params-table">
+              <tr><th>Field</th><th>Type</th><th></th><th>Description</th></tr>
+              <tr><td class="param-name">code_zip</td><td class="param-type">file</td><td class="param-req">req</td><td class="param-desc">Zip archive of the repository</td></tr>
+              <tr><td class="param-name">webhook_url</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">URL to POST job status updates to</td></tr>
+            </table>
+          </div>
+          <div class="body-section">
+            <h4>Example (curl)</h4>
+            <pre>curl -X POST \
+  -H "Authorization: Bearer &lt;token&gt;" \
+  -F "code_zip=@repo.zip" \
+  /embeddings/acme/my-service</pre>
+            <h4 style="margin-top:14px;">Response</h4>
+            <pre>{
+  <span class="k">"status"</span>:     <span class="s">"queued"</span>,
+  <span class="k">"job_id"</span>:     <span class="s">"b2e4d8..."</span>,
+  <span class="k">"namespace"</span>:  <span class="s">"acme"</span>,
+  <span class="k">"project_id"</span>: <span class="s">"my-service"</span>
+}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 
-      function setStatus(msg, cls) {
-        statusEl.textContent = msg;
-        statusEl.className = "status " + (cls || "");
+  <!-- ── Search ── -->
+  <div class="group">
+    <div class="group-label">Search</div>
+
+    <!-- POST /search/text -->
+    <div class="endpoint" id="ep-search-text">
+      <div class="endpoint-header" onclick="toggle('ep-search-text')">
+        <span class="method post">POST</span>
+        <span class="endpoint-path">/search/text</span>
+        <span class="endpoint-desc">Search with raw query — recommended</span>
+        <span class="chevron">▼</span>
+      </div>
+      <div class="endpoint-body">
+        <p style="font-size:13px;color:var(--muted);margin-top:12px;">
+          The simplest search endpoint. Pass a plain-text query; the server reads the index metadata
+          and automatically picks the correct embedding model (Voyage AI or CodeBERT).
+          No pre-computed embedding needed.
+          <span class="open-badge">&#x1F513; no auth required</span>
+        </p>
+        <div class="body-grid">
+          <div class="body-section">
+            <h4>Request body</h4>
+            <table class="params-table">
+              <tr><th>Field</th><th>Type</th><th></th><th>Description</th></tr>
+              <tr><td class="param-name">namespace</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Namespace of the indexed project</td></tr>
+              <tr><td class="param-name">project_id</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Project identifier</td></tr>
+              <tr><td class="param-name">query</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Natural language search query</td></tr>
+              <tr><td class="param-name">k</td><td class="param-type">integer</td><td class="param-opt">opt</td><td class="param-desc">Number of results (default: 5)</td></tr>
+            </table>
+          </div>
+          <div class="body-section">
+            <h4>Request</h4>
+            <pre>{
+  <span class="k">"namespace"</span>:  <span class="s">"vercel"</span>,
+  <span class="k">"project_id"</span>: <span class="s">"next.js"</span>,
+  <span class="k">"query"</span>:      <span class="s">"how does file-system routing work"</span>,
+  <span class="k">"k"</span>:          <span class="n">5</span>
+}</pre>
+            <h4 style="margin-top:14px;">Response</h4>
+            <pre>{
+  <span class="k">"namespace"</span>:  <span class="s">"vercel"</span>,
+  <span class="k">"project_id"</span>: <span class="s">"next.js"</span>,
+  <span class="k">"embedder"</span>:   <span class="s">"VoyageEmbedder"</span>,
+  <span class="k">"results"</span>: [
+    {
+      <span class="k">"rank"</span>:             <span class="n">1</span>,
+      <span class="k">"similarity_score"</span>: <span class="n">0.91</span>,
+      <span class="k">"metadata"</span>: {
+        <span class="k">"file_path"</span>:   <span class="s">"packages/next/src/server/..."</span>,
+        <span class="k">"chunk_type"</span>:  <span class="s">"function"</span>,
+        <span class="k">"symbol_name"</span>: <span class="s">"resolveFilesystemRoute"</span>,
+        <span class="k">"content"</span>:     <span class="s">"..."</span>
       }
+    }
+  ]
+}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
 
-      function clearAll() {
-        tutorialEl.textContent = "No tutorial yet.";
-        tutorialEl.className = "tutorial muted";
-        sourcesEl.textContent = "No sources yet.";
-        sourcesEl.className = "sources muted";
-        setStatus("Cleared.", "");
-      }
+    <!-- POST /search -->
+    <div class="endpoint" id="ep-search">
+      <div class="endpoint-header" onclick="toggle('ep-search')">
+        <span class="method post">POST</span>
+        <span class="endpoint-path">/search</span>
+        <span class="endpoint-desc">Search with a pre-computed embedding</span>
+        <span class="chevron">▼</span>
+      </div>
+      <div class="endpoint-body">
+        <p style="font-size:13px;color:var(--muted);margin-top:12px;">
+          Search using a vector you already computed. Optionally include the raw <code style="font-family:var(--mono);color:var(--orange)">text</code>
+          field so the server can re-embed automatically on dimension mismatch.
+          <span class="open-badge">&#x1F513; no auth required</span>
+        </p>
+        <div class="body-grid">
+          <div class="body-section">
+            <h4>Request body</h4>
+            <table class="params-table">
+              <tr><th>Field</th><th>Type</th><th></th><th>Description</th></tr>
+              <tr><td class="param-name">namespace</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Namespace of the indexed project</td></tr>
+              <tr><td class="param-name">project_id</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Project identifier</td></tr>
+              <tr><td class="param-name">embedding</td><td class="param-type">float[]</td><td class="param-req">req</td><td class="param-desc">Query vector</td></tr>
+              <tr><td class="param-name">k</td><td class="param-type">integer</td><td class="param-opt">opt</td><td class="param-desc">Number of results (default: 5)</td></tr>
+              <tr><td class="param-name">text</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">Raw query text — used for auto re-embedding on dimension mismatch</td></tr>
+            </table>
+          </div>
+          <div class="body-section">
+            <h4>Request</h4>
+            <pre>{
+  <span class="k">"namespace"</span>:  <span class="s">"vercel"</span>,
+  <span class="k">"project_id"</span>: <span class="s">"next.js"</span>,
+  <span class="k">"embedding"</span>:  [<span class="n">0.021</span>, <span class="n">-0.134</span>, <span class="n">...</span>],
+  <span class="k">"k"</span>:          <span class="n">5</span>
+}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
 
-      async function generate() {
-        const namespace = document.getElementById("namespace").value.trim();
-        const project_id = document.getElementById("project_id").value.trim();
-        const focus = document.getElementById("focus").value.trim() || null;
-        const model = document.getElementById("model").value.trim() || null;
-        const k = Number(document.getElementById("k").value || "8");
+    <!-- POST /embed -->
+    <div class="endpoint" id="ep-embed">
+      <div class="endpoint-header" onclick="toggle('ep-embed')">
+        <span class="method post">POST</span>
+        <span class="endpoint-path">/embed</span>
+        <span class="endpoint-desc">Embed a text string</span>
+        <span class="chevron">▼</span>
+      </div>
+      <div class="endpoint-body">
+        <p style="font-size:13px;color:var(--muted);margin-top:12px;">
+          Embed arbitrary text. Provide <code style="font-family:var(--mono);color:var(--orange)">namespace</code> + <code style="font-family:var(--mono);color:var(--orange)">project_id</code>
+          and the server auto-selects the correct model from index metadata.
+          <span class="open-badge">&#x1F513; no auth required</span>
+        </p>
+        <div class="body-grid">
+          <div class="body-section">
+            <h4>Request body</h4>
+            <table class="params-table">
+              <tr><th>Field</th><th>Type</th><th></th><th>Description</th></tr>
+              <tr><td class="param-name">text</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Text to embed</td></tr>
+              <tr><td class="param-name">namespace</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">Used to auto-detect the right model</td></tr>
+              <tr><td class="param-name">project_id</td><td class="param-type">string</td><td class="param-opt">opt</td><td class="param-desc">Used to auto-detect the right model</td></tr>
+              <tr><td class="param-name">use_cloud</td><td class="param-type">boolean</td><td class="param-opt">opt</td><td class="param-desc">Force Voyage AI (default: false)</td></tr>
+            </table>
+          </div>
+          <div class="body-section">
+            <h4>Request</h4>
+            <pre>{
+  <span class="k">"text"</span>:       <span class="s">"how does routing work"</span>,
+  <span class="k">"namespace"</span>:  <span class="s">"vercel"</span>,
+  <span class="k">"project_id"</span>: <span class="s">"next.js"</span>
+}</pre>
+            <h4 style="margin-top:14px;">Response</h4>
+            <pre>{
+  <span class="k">"embedding"</span>: [<span class="n">0.021</span>, <span class="n">-0.134</span>, <span class="n">...</span>],
+  <span class="k">"model"</span>:     <span class="s">"voyage-code-3"</span>
+}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 
-        if (!namespace || !project_id) {
-          setStatus("Missing required fields: namespace and project_id", "err");
-          return;
-        }
+  <!-- ── Management ── -->
+  <div class="group">
+    <div class="group-label">Management</div>
 
-        setStatus("Generating tutorial...");
-        const payload = { namespace, project_id, focus, model, k };
-        const res = await fetch("/tutorial", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        if (!res.ok || data.error) {
-          setStatus("Error: " + (data.error || res.status), "err");
-          return;
-        }
+    <!-- GET /jobs/{job_id} -->
+    <div class="endpoint" id="ep-jobs">
+      <div class="endpoint-header" onclick="toggle('ep-jobs')">
+        <span class="method get">GET</span>
+        <span class="endpoint-path">/jobs/<span class="param">{job_id}</span></span>
+        <span class="endpoint-desc">Poll indexing job status</span>
+        <span class="chevron">▼</span>
+      </div>
+      <div class="endpoint-body">
+        <p style="font-size:13px;color:var(--muted);margin-top:12px;">
+          Returns the current status of an indexing job.
+          Status values: <code style="font-family:var(--mono)">queued</code> → <code style="font-family:var(--mono)">downloading</code> → <code style="font-family:var(--mono)">running</code> → <code style="font-family:var(--mono)">completed</code> | <code style="font-family:var(--mono)">failed</code>
+          <span class="auth-badge">&#x1F512; Bearer token required</span>
+        </p>
+        <div class="body-grid">
+          <div class="body-section">
+            <h4>Path params</h4>
+            <table class="params-table">
+              <tr><th>Param</th><th>Type</th><th></th><th>Description</th></tr>
+              <tr><td class="param-name">job_id</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Job ID returned by an index endpoint</td></tr>
+            </table>
+          </div>
+          <div class="body-section">
+            <h4>Response</h4>
+            <pre>{
+  <span class="k">"job_id"</span>:        <span class="s">"a3f9c1..."</span>,
+  <span class="k">"status"</span>:        <span class="s">"completed"</span>,
+  <span class="k">"namespace"</span>:     <span class="s">"vercel"</span>,
+  <span class="k">"project_id"</span>:    <span class="s">"next.js"</span>,
+  <span class="k">"total_vectors"</span>: <span class="n">2841</span>,
+  <span class="k">"embedder"</span>:      <span class="s">"VoyageEmbedder"</span>,
+  <span class="k">"created_at"</span>:    <span class="s">"2024-01-15T10:32:00Z"</span>,
+  <span class="k">"updated_at"</span>:    <span class="s">"2024-01-15T10:34:18Z"</span>
+}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
 
-        tutorialEl.textContent = data.tutorial || "No tutorial returned.";
-        tutorialEl.className = "tutorial";
-        sourcesEl.textContent = JSON.stringify(data.sources || [], null, 2);
-        sourcesEl.className = "sources";
-        setStatus("Done.", "ok");
-      }
+    <!-- GET /embeddings/{namespace}/{project_id} -->
+    <div class="endpoint" id="ep-get-embeddings">
+      <div class="endpoint-header" onclick="toggle('ep-get-embeddings')">
+        <span class="method get">GET</span>
+        <span class="endpoint-path">/embeddings/<span class="param">{namespace}</span>/<span class="param">{project_id}</span></span>
+        <span class="endpoint-desc">Get index info</span>
+        <span class="chevron">▼</span>
+      </div>
+      <div class="endpoint-body">
+        <p style="font-size:13px;color:var(--muted);margin-top:12px;">
+          Returns metadata about a stored index: vector count, embedder, model, dimension.
+          <span class="auth-badge">&#x1F512; Bearer token required</span>
+        </p>
+        <div class="body-grid">
+          <div class="body-section">
+            <h4>Path params</h4>
+            <table class="params-table">
+              <tr><th>Param</th><th>Type</th><th></th><th>Description</th></tr>
+              <tr><td class="param-name">namespace</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Storage namespace</td></tr>
+              <tr><td class="param-name">project_id</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Project identifier</td></tr>
+            </table>
+          </div>
+          <div class="body-section">
+            <h4>Response</h4>
+            <pre>{
+  <span class="k">"namespace"</span>:     <span class="s">"vercel"</span>,
+  <span class="k">"project_id"</span>:    <span class="s">"next.js"</span>,
+  <span class="k">"total_vectors"</span>: <span class="n">2841</span>,
+  <span class="k">"embedder"</span>:      <span class="s">"VoyageEmbedder"</span>,
+  <span class="k">"model"</span>:         <span class="s">"voyage-code-3"</span>,
+  <span class="k">"embedding_dim"</span>: <span class="n">1024</span>,
+  <span class="k">"use_cloud"</span>:     <span class="n">true</span>
+}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
 
-      document.getElementById("generateBtn").addEventListener("click", generate);
-      document.getElementById("clearBtn").addEventListener("click", clearAll);
-    </script>
-  </body>
+    <!-- DELETE /embeddings/{namespace}/{project_id} -->
+    <div class="endpoint" id="ep-delete-embeddings">
+      <div class="endpoint-header" onclick="toggle('ep-delete-embeddings')">
+        <span class="method delete">DELETE</span>
+        <span class="endpoint-path">/embeddings/<span class="param">{namespace}</span>/<span class="param">{project_id}</span></span>
+        <span class="endpoint-desc">Delete a project's index</span>
+        <span class="chevron">▼</span>
+      </div>
+      <div class="endpoint-body">
+        <p style="font-size:13px;color:var(--muted);margin-top:12px;">
+          Permanently removes all vectors and index metadata for a project.
+          <span class="auth-badge">&#x1F512; Bearer token required</span>
+        </p>
+        <div class="body-grid">
+          <div class="body-section">
+            <h4>Path params</h4>
+            <table class="params-table">
+              <tr><th>Param</th><th>Type</th><th></th><th>Description</th></tr>
+              <tr><td class="param-name">namespace</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Storage namespace</td></tr>
+              <tr><td class="param-name">project_id</td><td class="param-type">string</td><td class="param-req">req</td><td class="param-desc">Project identifier</td></tr>
+            </table>
+          </div>
+          <div class="body-section">
+            <h4>Response</h4>
+            <pre>{
+  <span class="k">"deleted"</span>:     <span class="n">true</span>,
+  <span class="k">"namespace"</span>:  <span class="s">"vercel"</span>,
+  <span class="k">"project_id"</span>: <span class="s">"next.js"</span>
+}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /group -->
+</div><!-- /wrap -->
+
+<script>
+  // Auto-set base URL from current host
+  const base = document.getElementById("baseUrl");
+  base.textContent = window.location.origin;
+
+  function toggle(id) {
+    document.getElementById(id).classList.toggle("open");
+  }
+
+  function copyBase() {
+    navigator.clipboard.writeText(base.textContent);
+    const btn = document.querySelector(".copy-btn");
+    const orig = btn.textContent;
+    btn.textContent = "Copied!";
+    setTimeout(() => btn.textContent = orig, 1500);
+  }
+</script>
+</body>
 </html>

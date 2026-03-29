@@ -15,11 +15,8 @@ from __future__ import annotations
 import os
 import logging
 
-# Disable HuggingFace network calls
+# Suppress HuggingFace telemetry but allow model downloads on first run
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
@@ -39,7 +36,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "microsoft/codebert-base"
 EMBEDDING_DIM = 768
 
-LARGE_CODEBASE_THRESHOLD = 500  # chunks; above this, use cloud embedder
+LARGE_CODEBASE_THRESHOLD = 99999  # chunks; above this, use cloud embedder
 
 VOYAGE_API_URL = "https://api.voyageai.com/v1/embeddings"
 VOYAGE_MODEL = "voyage-code-3"

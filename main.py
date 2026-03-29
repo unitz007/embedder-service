@@ -10,29 +10,31 @@ from typing import List, Optional
 
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Form, Request, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import requests
 
-from pathlib import Path
-
-from indexing.full_pipeline import full_pipeline_chroma
-from store.chroma_store import ChromaStore, reset_chroma_dir
-from store.project_store import ProjectStore
+from indexing.full_pipeline import full_pipeline_pgvector
+from store.pgvector_store import PgVectorStore
 from lib.embedder import CodeEmbedder, VoyageEmbedder, DEFAULT_MODEL
+import db
 
 app = FastAPI()
 
-CHROMA_BASE_DIR = os.getenv("CHROMA_DIR") or os.path.abspath(os.path.join(os.getcwd(), "chroma_data"))
 GITHUB_API_BASE = os.getenv("GITHUB_API_BASE", "https://api.github.com")
 GITHUB_API_VERSION = os.getenv("GITHUB_API_VERSION", "2022-11-28")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
 
-# Simple in-memory job tracker for personal use (resets on restart)
-JOBS = {}
+# Jobs are persisted in Postgres (local for dev, Supabase for prod)
 
 # Reuse a single local embedder instance to avoid reload per request
 EMBEDDER = CodeEmbedder(DEFAULT_MODEL)
+
+
+@app.on_event("startup")
+def _startup():
+    db.init_db()
 
 
 
@@ -79,13 +81,14 @@ class EmbedRequest(BaseModel):
     project_id: Optional[str] = Field(None, description="See namespace.")
 
 class GitHubIndexRequest(BaseModel):
-    owner: str
-    repo: str
+    owner: Optional[str] = None
+    repo: Optional[str] = None
     ref: Optional[str] = None
     namespace: Optional[str] = None
     project_id: Optional[str] = None
     webhook_url: Optional[str] = None
     access_token: Optional[str] = Field(None, description="OAuth2 access token for GitHub")
+    path: Optional[str] = Field(None, description="Absolute path to a local directory to index instead of fetching from GitHub")
 
 
 def _require_bearer_token(request: Request) -> str:
@@ -96,38 +99,33 @@ def _require_bearer_token(request: Request) -> str:
 
 
 
-def _read_index_meta(persist_dir: str) -> dict:
-    """Return the index_meta.json for a persisted index, or {} if missing."""
-    meta_path = Path(persist_dir) / "index_meta.json"
-    if meta_path.exists():
-        try:
-            with open(meta_path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+def _read_index_meta(namespace: str, project_id: str) -> dict:
+    """Return index metadata from the database, or {} if missing."""
+    return db.get_index_meta(namespace, project_id) or {}
 
 
 def _job_update(job_id, **updates):
-    job = JOBS.get(job_id, {})
-    job.update(updates)
-    job["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    JOBS[job_id] = job
-    return job
+    updates["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    return db.update_job(job_id, **updates)
 
 
-def _job_create(namespace, project_id, filename, webhook_url=None):
+def _job_create(namespace, project_id, filename, webhook_url=None, source=None, owner=None, repo=None, ref=None):
     job_id = uuid4().hex
-    JOBS[job_id] = {
-        "job_id": job_id,
-        "namespace": namespace,
-        "project_id": project_id,
-        "filename": filename,
-        "status": "queued",
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "updated_at": datetime.utcnow().isoformat() + "Z",
-        "webhook_url": webhook_url,
-    }
+    created_at = datetime.utcnow().isoformat() + "Z"
+    db.create_job(
+        job_id=job_id,
+        namespace=namespace,
+        project_id=project_id,
+        filename=filename,
+        status="queued",
+        created_at=created_at,
+        updated_at=created_at,
+        webhook_url=webhook_url,
+        source=source,
+        owner=owner,
+        repo=repo,
+        ref=ref,
+    )
     return job_id
 
 
@@ -146,25 +144,31 @@ def _notify_webhook(job: dict) -> None:
         print(f"Webhook notify failed: {e}")
 
 
-def _resolve_github_token(req_token: Optional[str], auth_header: Optional[str]) -> str:
+def _resolve_github_token(req_token: Optional[str], auth_header: Optional[str]) -> Optional[str]:
+    """Return the GitHub token if one was provided, or None for public-repo access."""
     if req_token:
         return req_token
     if auth_header and auth_header.lower().startswith("bearer "):
         return auth_header.split(" ", 1)[1].strip()
-    raise HTTPException(status_code=401, detail="Missing GitHub OAuth token (access_token or Authorization header)")
+    return None
 
 
-def _github_download_zip(pat: str, owner: str, repo: str, ref: Optional[str], zip_path: str) -> None:
+def _github_headers(token: Optional[str]) -> dict:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _github_download_zip(token: Optional[str], owner: str, repo: str, ref: Optional[str], zip_path: str) -> None:
     if ref:
         url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/zipball/{ref}"
     else:
         url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/zipball"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {pat}",
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-    }
-    with requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=60) as r:
+    with requests.get(url, headers=_github_headers(token), stream=True, allow_redirects=True, timeout=60) as r:
         if r.status_code not in (200, 302):
             raise RuntimeError(f"GitHub zip download error {r.status_code}: {r.text}")
         with open(zip_path, "wb") as f:
@@ -173,16 +177,16 @@ def _github_download_zip(pat: str, owner: str, repo: str, ref: Optional[str], zi
                     f.write(chunk)
 
 
-def _github_validate_access(token: str, owner: str, repo: str) -> None:
+def _github_validate_access(token: Optional[str], owner: str, repo: str) -> None:
     url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-    }
-    resp = requests.get(url, headers=headers, timeout=15)
+    resp = requests.get(url, headers=_github_headers(token), timeout=15)
     if resp.status_code == 200:
         return
+    if resp.status_code == 404 and not token:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Repository {owner}/{repo} not found or is private. Provide an access_token to index private repositories.",
+        )
     raise HTTPException(status_code=resp.status_code, detail=f"GitHub auth failed: {resp.text}")
 
 
@@ -214,21 +218,20 @@ def process_zip(temp_dir, zip_path, namespace, project_id, job_id):
             safe_extract(zip_ref, extract_path)
 
         repo_root = get_repo_root(extract_path)
-        persist_dir = os.path.join(CHROMA_BASE_DIR, namespace, project_id)
-        os.makedirs(persist_dir, exist_ok=True)
 
-        store, call_graph, import_graph, embedder_name = full_pipeline_chroma(
+        store, call_graph, import_graph, index_meta = full_pipeline_pgvector(
             repo_path=repo_root,
-            chroma_dir=persist_dir,
-            graphs_prefix=os.path.join(persist_dir, "vector_store"),
+            namespace=namespace,
+            project_id=project_id,
         )
+        db.upsert_index_meta(namespace, project_id, index_meta)
 
         job = _job_update(
             job_id,
             status="completed",
             total_vectors=store.get_total_vectors(),
-            persist_dir=persist_dir,
-            embedder=embedder_name,
+            persist_dir="pgvector",
+            embedder=index_meta.get("embedder"),
         )
         _notify_webhook(job)
     except Exception as e:
@@ -239,7 +242,7 @@ def process_zip(temp_dir, zip_path, namespace, project_id, job_id):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "indexer"}
+    return FileResponse(os.path.join(os.path.dirname(__file__), "web", "index.html"))
 
 @app.post("/embeddings/{namespace}/{project_id}")
 async def post_embeddings(
@@ -259,7 +262,7 @@ async def post_embeddings(
     with open(zip_path, "wb") as f:
         shutil.copyfileobj(code_zip.file, f)
 
-    job_id = _job_create(namespace, project_id, code_zip.filename, webhook_url=webhook_url)
+    job_id = _job_create(namespace, project_id, code_zip.filename, webhook_url=webhook_url, source="upload")
     background_tasks.add_task(process_zip, temp_dir, zip_path, namespace, project_id, job_id)
 
     return {
@@ -272,26 +275,16 @@ async def post_embeddings(
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, request: Request):
     _require_bearer_token(request)
-    job = JOBS.get(job_id)
+    job = db.get_job(job_id)
     if not job:
         return {"error": "job not found"}
     return job
 
 
 @app.delete("/embeddings/{namespace}/{project_id}")
-def delete_embeddings(namespace: str, project_id: str):
-    persist_dir = os.path.join(CHROMA_BASE_DIR, namespace, project_id)
-    if not os.path.exists(persist_dir):
-        return {"error": "index not found", "namespace": namespace, "project_id": project_id}
-
-    # reset_chroma_dir evicts the client cache AND calls
-    # SharedSystemClient.clear_system_cache() to stop ChromaDB's background
-    # threads (WAL checkpoint, segment GC).  Without that second step, those
-    # threads write back into the directory moments after rmtree, causing
-    # SQLITE_READONLY_DBMOVED (code 1032) on the next operation.
-    # reset_chroma_dir recreates the directory at the end, so we remove it again.
-    reset_chroma_dir(persist_dir)
-    shutil.rmtree(persist_dir, ignore_errors=True)
+def delete_embeddings(namespace: str, project_id: str, request: Request):
+    _require_bearer_token(request)
+    db.delete_embeddings(namespace, project_id)
 
     # Also clean up any leftover temp upload files for this project.
     temp_dir = f"/tmp/{namespace}/{project_id}"
@@ -304,30 +297,23 @@ def delete_embeddings(namespace: str, project_id: str):
 @app.get("/embeddings/{namespace}/{project_id}")
 def get_embeddings(namespace: str, project_id: str, request: Request):
     _require_bearer_token(request)
-    persist_dir = os.path.join(CHROMA_BASE_DIR, namespace, project_id)
-    if not os.path.exists(persist_dir):
-        return {"error": "index not found", "namespace": namespace, "project_id": project_id}
-    store = ChromaStore(persist_dir=persist_dir)
-    index_meta = _read_index_meta(persist_dir)
+    store = PgVectorStore(namespace=namespace, project_id=project_id)
+    index_meta = _read_index_meta(namespace, project_id)
     return {
         "namespace": namespace,
         "project_id": project_id,
         "total_vectors": store.get_total_vectors(),
-        "persist_dir": persist_dir,
+        "persist_dir": "pgvector",
         **index_meta,
     }
 
 
 @app.post("/search")
-def search_embeddings(req: SearchRequest, request: Request):
-    _require_bearer_token(request)
-    persist_dir = os.path.join(CHROMA_BASE_DIR, req.namespace, req.project_id)
-    if not os.path.exists(persist_dir):
-        return {"error": "index not found", "namespace": req.namespace, "project_id": req.project_id}
+def search_embeddings(req: SearchRequest):
     if not req.embedding:
         return {"error": "embedding is empty"}
 
-    index_meta = _read_index_meta(persist_dir)
+    index_meta = _read_index_meta(req.namespace, req.project_id)
     expected_dim = index_meta.get("embedding_dim")
     embedding = req.embedding
 
@@ -354,7 +340,7 @@ def search_embeddings(req: SearchRequest, request: Request):
         else:
             embedding = EMBEDDER.encode([req.text])[0].tolist()
 
-    store = ChromaStore(persist_dir=persist_dir)
+    store = PgVectorStore(namespace=req.namespace, project_id=req.project_id)
     results = store.search(embedding, k=req.k or 5)
     return {
         "namespace": req.namespace,
@@ -372,18 +358,13 @@ def search_embeddings(req: SearchRequest, request: Request):
 
 
 @app.post("/search/text")
-def search_by_text(req: TextSearchRequest, request: Request):
-    _require_bearer_token(request)
+def search_by_text(req: TextSearchRequest):
     """Search using raw query text — the server picks the correct embedding model
     automatically by reading the index metadata. No pre-computed embedding needed."""
     if not req.query.strip():
         return {"error": "query is empty"}
 
-    persist_dir = os.path.join(CHROMA_BASE_DIR, req.namespace, req.project_id)
-    if not os.path.exists(persist_dir):
-        return {"error": "index not found", "namespace": req.namespace, "project_id": req.project_id}
-
-    index_meta = _read_index_meta(persist_dir)
+    index_meta = _read_index_meta(req.namespace, req.project_id)
 
     if index_meta.get("use_cloud"):
         if not VOYAGE_API_KEY:
@@ -392,7 +373,7 @@ def search_by_text(req: TextSearchRequest, request: Request):
     else:
         embedding = EMBEDDER.encode([req.query])[0].tolist()
 
-    store = ChromaStore(persist_dir=persist_dir)
+    store = PgVectorStore(namespace=req.namespace, project_id=req.project_id)
     results = store.search(embedding, k=req.k or 5)
     return {
         "namespace": req.namespace,
@@ -411,8 +392,7 @@ def search_by_text(req: TextSearchRequest, request: Request):
 
 
 @app.post("/embed")
-def embed_text(req: EmbedRequest, request: Request):
-    _require_bearer_token(request)
+def embed_text(req: EmbedRequest):
     if not req.text.strip():
         return {"error": "text is empty"}
 
@@ -420,8 +400,7 @@ def embed_text(req: EmbedRequest, request: Request):
     # caller doesn't have to set use_cloud manually.
     use_cloud = req.use_cloud
     if not use_cloud and req.namespace and req.project_id:
-        persist_dir = os.path.join(CHROMA_BASE_DIR, req.namespace, req.project_id)
-        meta = _read_index_meta(persist_dir)
+        meta = _read_index_meta(req.namespace, req.project_id)
         use_cloud = bool(meta.get("use_cloud", False))
 
     if use_cloud:
@@ -435,8 +414,47 @@ def embed_text(req: EmbedRequest, request: Request):
     return {"embedding": embedding, "model": DEFAULT_MODEL}
 
 
+def _process_local_path(repo_path: str, namespace: str, project_id: str, job_id: str):
+    try:
+        _job_update(job_id, status="running")
+        store, call_graph, import_graph, index_meta = full_pipeline_pgvector(
+            repo_path=repo_path,
+            namespace=namespace,
+            project_id=project_id,
+        )
+        db.upsert_index_meta(namespace, project_id, index_meta)
+        job = _job_update(
+            job_id,
+            status="completed",
+            total_vectors=store.get_total_vectors(),
+            persist_dir="pgvector",
+            embedder=index_meta.get("embedder"),
+        )
+        _notify_webhook(job)
+    except Exception as e:
+        job = _job_update(job_id, status="failed", error=str(e))
+        _notify_webhook(job)
+        raise
+
+
 @app.post("/github/index")
 def github_index(req: GitHubIndexRequest, background_tasks: BackgroundTasks, request: Request):
+    # --- Local path branch ---
+    if req.path:
+        if not os.path.isdir(req.path):
+            raise HTTPException(status_code=400, detail=f"Local path does not exist or is not a directory: {req.path}")
+        folder_name = os.path.basename(req.path.rstrip("/"))
+        namespace = req.namespace or folder_name
+        project_id = req.project_id or folder_name
+        job_id = _job_create(namespace, project_id, req.path, webhook_url=req.webhook_url, source="local")
+        _job_update(job_id, status="queued", source="local")
+        background_tasks.add_task(_process_local_path, req.path, namespace, project_id, job_id)
+        return {"status": "queued", "job_id": job_id, "namespace": namespace, "project_id": project_id}
+
+    # --- GitHub branch ---
+    if not req.owner or not req.repo:
+        raise HTTPException(status_code=400, detail="Provide either 'path' (local directory) or both 'owner' and 'repo' (GitHub repository)")
+
     token = _resolve_github_token(req.access_token, request.headers.get("authorization"))
     _github_validate_access(token, req.owner, req.repo)
     namespace = req.namespace or req.owner
@@ -448,7 +466,16 @@ def github_index(req: GitHubIndexRequest, background_tasks: BackgroundTasks, req
     zip_filename = f"{req.owner}-{req.repo}.zip"
     zip_path = os.path.join(temp_dir, zip_filename)
 
-    job_id = _job_create(namespace, project_id, zip_filename, webhook_url=req.webhook_url)
+    job_id = _job_create(
+        namespace,
+        project_id,
+        zip_filename,
+        webhook_url=req.webhook_url,
+        source="github",
+        owner=req.owner,
+        repo=req.repo,
+        ref=req.ref,
+    )
     _job_update(job_id, status="queued", source="github", owner=req.owner, repo=req.repo, ref=req.ref)
 
     def _download_and_process():
@@ -470,4 +497,5 @@ def github_index(req: GitHubIndexRequest, background_tasks: BackgroundTasks, req
 
 
 if __name__ == "__main__":
+    db.init_db()
     uvicorn.run("main:app", reload=True)

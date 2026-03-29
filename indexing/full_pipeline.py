@@ -28,6 +28,7 @@ from lib.graph import (
 )
 from utils.file_scanner import scan_repository
 from utils.language_router import analyze_file
+from store.pgvector_store import PgVectorStore
 
 
 def index_repository(
@@ -241,3 +242,85 @@ def full_pipeline_chroma(
     print("=" * 50)
     print("Chroma pipeline completed!")
     return store, call_graph, import_graph, type(embedder).__name__
+
+
+# ---------------------------------------------------------------------------
+# pgvector pipeline
+# ---------------------------------------------------------------------------
+
+def full_pipeline_pgvector(
+    repo_path: str,
+    namespace: str,
+    project_id: str,
+    model_name: str = "microsoft/codebert-base",
+    include_dotfiles: bool = False,
+) -> tuple:
+    """
+    Run the complete pipeline and store vectors in Postgres/pgvector.
+
+    Args:
+        repo_path:        Path to the repository to index.
+        namespace:        Namespace for multi-tenant storage.
+        project_id:       Project identifier.
+        model_name:       Embedding model (sentence-transformers).
+        include_dotfiles: Include hidden files.
+
+    Returns:
+        Tuple of (PgVectorStore, call_graph dict, import_graph dict, index_meta dict)
+    """
+    print(f"Starting pgvector pipeline for repository: {repo_path}")
+    print("=" * 50)
+
+    # Steps 1-5: Symbol extraction
+    analyses = index_repository(repo_path, include_dotfiles=include_dotfiles)
+
+    # Step 5b: Import graph
+    print("Step 5b: Building import relationship graph...")
+    import_graph = build_import_graph(analyses)
+
+    # Step 5c: Call graph
+    print("Step 5c: Building call graph...")
+    call_graph = build_call_graph(analyses)
+
+    # Step 6: Chunking + graph enrichment
+    chunks = chunk_analyses(analyses)
+    chunks = enrich_chunks_with_graph(chunks, import_graph)
+    chunks = enrich_chunks_with_call_graph(chunks, call_graph)
+
+    # Step 7: Embeddings — pick cloud or local based on codebase size
+    if len(chunks) > LARGE_CODEBASE_THRESHOLD:
+        print(
+            f"Step 7: {len(chunks)} chunks exceeds threshold "
+            f"({LARGE_CODEBASE_THRESHOLD}). Using Voyage AI cloud embedder..."
+        )
+        embedder = VoyageEmbedder()
+    else:
+        print(
+            f"Step 7: {len(chunks)} chunks. Using local CodeBERT embedder..."
+        )
+        embedder = CodeEmbedder(model_name)
+
+    chunks_with_embeddings = generate_embeddings(chunks, embedder=embedder)
+
+    # Step 8: Store in Postgres/pgvector (replace_all to avoid stale vectors)
+    print("Step 8: Storing in pgvector...")
+    store = PgVectorStore(namespace=namespace, project_id=project_id)
+    if chunks_with_embeddings:
+        embeddings = [c["embedding"] for c in chunks_with_embeddings]
+        metadata = [c["metadata"] for c in chunks_with_embeddings]
+        store.add_vectors(embeddings, metadata, replace_all=True)
+    else:
+        store.add_vectors([], [], replace_all=True)
+
+    # Build index metadata so callers know which embedder was used
+    is_cloud = isinstance(embedder, VoyageEmbedder)
+    index_meta = {
+        "embedder": type(embedder).__name__,
+        "model": VOYAGE_MODEL if is_cloud else model_name,
+        "embedding_dim": VOYAGE_EMBEDDING_DIM if is_cloud else EMBEDDING_DIM,
+        "use_cloud": is_cloud,
+    }
+
+    print("=" * 50)
+    print("pgvector pipeline completed!")
+    return store, call_graph, import_graph, index_meta
