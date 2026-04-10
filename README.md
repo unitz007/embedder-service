@@ -1,244 +1,228 @@
-# Embedder Service
+# Code Indexer Service
 
-<!-- TODO: add project badges once CI/CD and licensing are configured -->
-<!-- [![Build Status](https://img.shields.io/github/actions/workflow/status/unitz007/embedder-service/ci.yml?branch=main)](https://github.com/unitz007/embedder-service/actions) -->
-<!-- [![Go Report Card](https://goreportcard.com/badge/github.com/unitz007/embedder-service)](https://goreportcard.com/report/github.com/unitz007/embedder-service) -->
-<!-- [![License](https://img.shields.io/github/license/unitz007/embedder-service)](./LICENSE) -->
+Semantic search infrastructure for codebases. Index any GitHub repository or local
+project, generate embeddings with CodeBERT or Voyage AI, and query with natural
+language over function signatures, docstrings, import graphs, and call graphs.
 
-A lightweight HTTP service that accepts text input and returns high-dimensional vector embeddings. Designed to plug into RAG pipelines, semantic search systems, and any application that needs to turn natural language or structured data into machine-readable vectors. The service abstracts over multiple embedding model providers (OpenAI, HuggingFace, local models, etc.) behind a simple RESTful API, making it easy to swap or compare models without changing downstream consumers.
+Built with **Python 3**, **FastAPI**, **Postgres/pgvector**, and **tree-sitter**.
 
 ## Features
 
-<!-- TODO: update this list once the implementation takes shape -->
-
-- **Simple REST API** — Send text, receive vectors. A single `POST /v1/embed` endpoint does the heavy lifting.
-- **Model provider abstraction** — Swap between OpenAI, HuggingFace, or locally-hosted models by changing configuration, not code.
-- **Batch support** — Embed multiple texts in a single request to reduce latency and network overhead.
-- **Configurable dimensions** — Control output vector dimensions via request parameters or server-side defaults.
-- **Health and readiness checks** — Built-in `/healthz` and `/readyz` endpoints for orchestration platforms.
+- **Multi-language AST analysis** — Parses Python, Go, JavaScript/TypeScript,
+  Rust, Java, Ruby, C, C++, Lua, shell scripts, and config files using
+  tree-sitter grammars and Python's `ast` module.
+- **Symbol extraction** — Extracts functions, methods, classes, structs,
+  interfaces, imports, and docstrings from each source file.
+- **Import & call graphs** — Builds file-level import dependency graphs and
+  symbol-level call graphs across the entire codebase.
+- **Semantic code search** — Embeds code chunks with
+  [microsoft/codebert-base](https://huggingface.co/microsoft/codebert-base)
+  (local, 768-d) or [Voyage AI voyage-code-3](https://docs.voyageai.com/)
+  (cloud, 1024-d) and stores them in Postgres/pgvector for cosine-similarity
+  search.
+- **Automatic model selection** — Uses the local CodeBERT embedder for small
+  codebases and automatically switches to Voyage AI for large ones.
+- **GitHub integration** — Clone and index public or private GitHub repos by
+  owner/repo with OAuth token support.
+- **Async job pipeline** — Indexing runs in background tasks with full job
+  lifecycle tracking (queued → downloading → running → completed/failed) and
+  webhook notifications.
+- **Dimension-mismatch handling** — The `/search/text` endpoint reads the
+  stored index metadata and automatically picks the correct embedding model at
+  query time, so callers never need to know which model was used at index time.
+- **Built-in web UI** — A single-page documentation and API explorer served at
+  the root URL.
 
 ## Quick Start
 
-<!-- TODO: fill in with actual build/run instructions once the project is bootstrapped -->
-
 ### Prerequisites
 
-- **Go 1.22+** (proposed default — see [Architecture](./ARCHITECTURE.md) for rationale)
-- <!-- TODO: add other prerequisites (Docker, model runtime, etc.) once confirmed -->
+- Python 3.10+
+- PostgreSQL with the [pgvector extension](https://github.com/pgvector/pgvector)
+- (Optional) A [Voyage AI API key](https://docs.voyageai.com/docs/api-key) for
+  indexing large codebases
 
-### Build
-
-```bash
-git clone https://github.com/unitz007/embedder-service.git
-cd embedder-service
-
-# Build the binary
-go build -o bin/embedder-service ./cmd/server
-
-# Or use Docker (once a Dockerfile is added)
-# docker build -t embedder-service .
-```
-
-### Run
+### Install dependencies
 
 ```bash
-# Start the server with default settings
-./bin/embedder-service
-
-# Or with environment variable overrides
-EMBEDDER_PORT=8080 EMBEDDER_MODEL=text-embedding-3-small ./bin/embedder-service
+pip install -r requirements.txt
 ```
 
-The server starts listening on `http://localhost:8080` by default.
+### Database setup
 
-### Docker
+```bash
+# Ensure the pgvector extension is available in your Postgres instance.
+# If using Supabase or a managed Postgres, it may already be installed.
 
-<!-- TODO: uncomment and adjust once a Dockerfile exists -->
+# Set the database connection URL:
+export DATABASE_URL="postgresql://user:password@localhost:5432/indexer"
 
-<!-- ```bash
-docker run -d \
-  -p 8080:8080 \
-  -e EMBEDDER_MODEL=text-embedding-3-small \
-  -e OPENAI_API_KEY=sk-... \
-  unitz007/embedder-service:latest
-``` -->
+# Or for local development without setting DATABASE_URL, the service
+# defaults to: postgresql://postgres:postgres@localhost:5432/indexer
+```
+
+### Run the service
+
+```bash
+uvicorn main:app --reload --port 8080
+```
+
+The API is available at `http://localhost:8080` and the web UI at the root URL.
+
+### Index a GitHub repository
+
+```bash
+curl -X POST http://localhost:8080/github/index \
+  -H "Content-Type: application/json" \
+  -d '{"owner": "vercel", "repo": "next.js"}'
+```
+
+Response:
+
+```json
+{
+  "status": "queued",
+  "job_id": "a3f9c1...",
+  "namespace": "vercel",
+  "project_id": "next.js"
+}
+```
+
+Poll the job status:
+
+```bash
+curl http://localhost:8080/jobs/a3f9c1...
+```
+
+### Search with natural language
+
+```bash
+curl -X POST http://localhost:8080/search/text \
+  -H "Content-Type: application/json" \
+  -d '{
+    "namespace": "vercel",
+    "project_id": "next.js",
+    "query": "how does file-system routing work",
+    "k": 5
+  }'
+```
 
 ## API Overview
 
-<!-- TODO: finalise the OpenAPI schema and link it here -->
+All endpoints are documented in the built-in web UI. Here's a summary:
 
-All API endpoints are prefixed with `/v1`. The service accepts and returns JSON.
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/github/index` | Open | Queue a GitHub repo or local path for indexing |
+| `POST` | `/embeddings/{ns}/{pid}` | Bearer | Upload a zip archive and index it |
+| `POST` | `/search/text` | Open | Search with raw query text (recommended) |
+| `POST` | `/search` | Open | Search with a pre-computed embedding vector |
+| `POST` | `/embed` | Open | Embed arbitrary text with the correct model |
+| `GET` | `/embeddings/{ns}/{pid}` | Bearer | Get index metadata and vector count |
+| `DELETE` | `/embeddings/{ns}/{pid}` | Bearer | Delete a project's index |
+| `GET` | `/jobs/{job_id}` | Bearer | Poll indexing job status |
 
-### `POST /v1/embed`
+### Authentication
 
-Generate embedding vectors for one or more text inputs.
-
-**Request body:**
-
-```json
-{
-  "texts": ["Hello, world!", "How does embedding work?"],
-  "model": "text-embedding-3-small",
-  "dimensions": 1536
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `texts` | `string[]` | Yes | One or more text strings to embed (max batch size TBD) |
-| `model` | `string` | No | Model identifier to use. Overrides the server default. |
-| `dimensions` | `integer` | No | Desired output dimensions. Model-dependent; may be ignored. |
-
-**Response (200 OK):**
-
-```json
-{
-  "model": "text-embedding-3-small",
-  "dimensions": 1536,
-  "embeddings": [
-    [0.0023, -0.0141, 0.0387, "..."],
-    [-0.0082, 0.0255, -0.0019, "..."]
-  ],
-  "usage": {
-    "prompt_tokens": 12,
-    "total_tokens": 12
-  }
-}
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `model` | `string` | The model that was used to generate embeddings |
-| `dimensions` | `integer` | Dimensionality of each embedding vector |
-| `embeddings` | `float[][]` | Array of embedding vectors, one per input text |
-| `usage` | `object` | Token usage information (provider-specific) |
-
-**Error responses:**
-
-| Status | Code | Description |
-|---|---|---|
-| 400 | `INVALID_REQUEST` | Request body is malformed or missing required fields |
-| 422 | `MODEL_NOT_FOUND` | The requested model is not configured or available |
-| 429 | `RATE_LIMITED` | Too many requests — retry after the `Retry-After` header |
-| 500 | `INTERNAL_ERROR` | An unexpected error occurred during embedding |
-
-### `GET /healthz`
-
-Liveness probe. Returns `200 OK` if the server process is running.
-
-### `GET /readyz`
-
-Readiness probe. Returns `200 OK` if the server is ready to accept requests (model loaded, dependencies available).
-
-### `GET /v1/models`
-
-<!-- TODO: implement once model registry is built -->
-
-Returns a list of available embedding models and their metadata.
-
-```json
-{
-  "models": [
-    {
-      "id": "text-embedding-3-small",
-      "provider": "openai",
-      "dimensions": 1536,
-      "max_input_tokens": 8191
-    }
-  ]
-}
-```
+Most endpoints are open. Management endpoints (upload, delete, status) require
+an `Authorization: Bearer <token>` header. The token value is not validated
+against any specific identity — it simply must be present.
 
 ## Configuration
 
-<!-- TODO: confirm the final configuration schema once implementation begins -->
-
-The service is configured via environment variables. All variables have sensible defaults for local development.
-
 | Variable | Description | Default |
-|---|---|---|
-| `EMBEDDER_PORT` | HTTP listen port | `8080` |
-| `EMBEDDER_HOST` | HTTP listen address | `0.0.0.0` |
-| `EMBEDDER_MODEL` | Default embedding model identifier | `text-embedding-3-small` |
-| `EMBEDDER_DIMENSIONS` | Default output dimensions | `1536` |
-| `EMBEDDER_LOG_LEVEL` | Log verbosity (`debug`, `info`, `warn`, `error`) | `info` |
-| `EMBEDDER_MAX_BATCH_SIZE` | Maximum number of texts per request | `64` |
-| `OPENAI_API_KEY` | API key for OpenAI provider | — |
-| `HUGGINGFACE_API_KEY` | API key for HuggingFace Inference API | — |
-| `OPENAI_BASE_URL` | Override OpenAI API base URL (for proxies) | — |
-| `CACHE_ENABLED` | Enable response caching | `false` |
-| `CACHE_TTL` | Cache time-to-live in seconds | `3600` |
-| `CACHE_BACKEND` | Cache backend (`memory`, `redis`) | `memory` |
-| `REDIS_URL` | Redis connection URL (when `CACHE_BACKEND=redis`) | `localhost:6379` |
+|----------|-------------|---------|
+| `DATABASE_URL` | Postgres connection string | `postgresql://postgres:postgres@localhost:5432/indexer` |
+| `LOCAL_DATABASE_URL` | Fallback for non-prod environments | (same as `DATABASE_URL`) |
+| `APP_ENV` | Application environment (`dev`, `prod`) | `dev` |
+| `VOYAGE_API_KEY` | Voyage AI API key (for large codebases) | — |
+| `WEBHOOK_SECRET` | HMAC secret for webhook notifications | — |
+| `GITHUB_API_BASE` | GitHub API base URL | `https://api.github.com` |
+| `GITHUB_API_VERSION` | GitHub API version header | `2022-11-28` |
+| `DB_POOL_MAX` | Postgres connection pool size | `20` |
 
-### Configuration File
+## Supported Languages
 
-<!-- TODO: decide on config file format (YAML, TOML, env) and document -->
+| Language | Parser | Extracts |
+|----------|--------|----------|
+| Python | `ast` (stdlib) | Functions, async functions, classes, methods, imports, docstrings |
+| Go | tree-sitter-go | Functions, methods (with receiver), structs, interfaces, type aliases, imports |
+| JavaScript / TypeScript | tree-sitter-javascript | Function declarations, arrow functions, classes, methods, exports, imports |
+| Rust | tree-sitter-rust | Functions, impl methods, structs, enums, traits, use declarations |
+| Java | tree-sitter-java | Methods, constructors, classes, interfaces, enums, imports |
+| Ruby | tree-sitter-ruby | Methods, singleton methods, classes, modules, requires |
+| C | tree-sitter-c | Functions, structs, enums, unions, `#include` directives |
+| C++ | tree-sitter-cpp | Functions, classes, structs, namespaces, enums, `#include` directives |
+| Lua | tree-sitter-lua | Functions, local functions, require calls |
+| Shell (bash/zsh/fish) | Regex | Functions, aliases, exports, source/include paths |
+| Config files | stdlib parsers | Sections, key-value pairs (YAML, TOML, JSON, INI, .env, .gitignore, etc.) |
 
-A configuration file can be used as an alternative to environment variables. The service looks for `config.yaml` in the working directory by default. Environment variables take precedence over file values.
+## Project Structure
+
+```
+.
+├── main.py                     # FastAPI application and all HTTP endpoints
+├── db.py                       # Postgres connection pool, schema init, CRUD
+├── models.py                   # Dataclasses: FileAnalysis, FunctionInfo, ClassInfo
+├── requirements.txt            # Python dependencies
+├── analyzers/                  # Per-language AST/symbol analyzers
+│   ├── python_analyzer.py      #   Python (ast module)
+│   ├── go_analyzer.py          #   Go (tree-sitter)
+│   ├── js_analyzer.py          #   JavaScript (tree-sitter)
+│   ├── generic_ts_analyzer.py  #   Rust, Java, Ruby, C, C++, Lua (config-driven)
+│   ├── shell_analyzer.py       #   Bash/zsh/fish (regex)
+│   └── config_analyzer.py      #   YAML, TOML, JSON, INI, .env, etc.
+├── indexing/
+│   ├── full_pipeline.py        # Orchestrates: scan → parse → chunk → embed → store
+│   └── USAGE_GUIDE.md          # Standalone LLM analysis guide
+├── lib/
+│   ├── chunker.py              # Splits FileAnalysis into embedding-ready chunks
+│   ├── embedder.py             # CodeBERT (local) and Voyage AI (cloud) embedders
+│   ├── graph.py                # Import graph and call graph builders
+│   └── indexer.py              # Thin wrapper: scan + analyze
+├── store/
+│   ├── pgvector_store.py       # pgvector-backed vector store (primary)
+│   ├── chroma_store.py         # ChromaDB-backed vector store (alternative)
+│   └── project_store.py        # JSON-file project metadata store
+├── utils/
+│   ├── file_scanner.py         # Repository walker with ignore rules
+│   └── language_router.py      # File extension → language → analyzer dispatch
+├── web/
+│   └── index.html              # Built-in API documentation UI
+├── .dockerignore
+├── .gitignore
+└── ARCHITECTURE.md             # Detailed architecture documentation
+```
+
+## How Indexing Works
+
+1. **Scan** — Walk the repository, skip VCS/build/generated files (configurable
+   ignore rules in `utils/file_scanner.py`).
+2. **Detect language** — Map each file to a language via its extension or name
+   (`utils/language_router.py`).
+3. **Analyze** — Run the appropriate parser to extract functions, classes,
+   imports, and docstrings into `FileAnalysis` objects.
+4. **Build graphs** — Construct a file-level import graph and a symbol-level
+   call graph across the entire codebase (`lib/graph.py`).
+5. **Chunk** — Split each file into embedding-ready chunks: one per function,
+   one per class, one for imports, and a file-level summary (`lib/chunker.py`).
+   Graph metadata (callers, callees, dependencies) is injected into each chunk.
+6. **Embed** — Generate vector embeddings. Small codebases use local CodeBERT
+   (768-d); large ones use Voyage AI voyage-code-3 (1024-d) (`lib/embedder.py`).
+7. **Store** — Upsert vectors into Postgres/pgvector with cosine-similarity
+   indexing (`store/pgvector_store.py`). Metadata includes file path, symbol
+   name, signature, docstring, params, return type, and graph relationships.
 
 ## Development
 
-<!-- TODO: fill in with concrete instructions once the project structure is bootstrapped -->
-
-### Project Layout
-
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full directory structure proposal.
-
-### Building
-
 ```bash
-# Build the server binary
-go build -o bin/embedder-service ./cmd/server
+# Run with auto-reload
+uvicorn main:app --reload
 
-# Build with race detector
-go build -race -o bin/embedder-service ./cmd/server
+# Run on a different port
+uvicorn main:app --port 3000
 ```
-
-### Testing
-
-```bash
-# Run all tests
-go test ./...
-
-# Run tests with verbose output and coverage
-go test -v -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
-```
-
-### Linting
-
-```bash
-# Lint the codebase
-golangci-lint run ./...
-
-# Format code
-gofmt -w .
-```
-
-### Running Locally
-
-```bash
-# Run directly with go run
-go run ./cmd/server
-
-# Or with hot-reload using air (once configured)
-air
-```
-
-## Links
-
-<!-- TODO: add real links as the project matures -->
-
-- [Architecture Documentation](./ARCHITECTURE.md)
-- [GitHub Repository](https://github.com/unitz007/embedder-service)
-- [Issues](https://github.com/unitz007/embedder-service/issues)
-<!-- - [API Reference (Swagger/OpenAPI)](./docs/api.yaml) -->
-<!-- - [Contributing Guide](./CONTRIBUTING.md) -->
-<!-- - [Changelog](./CHANGELOG.md) -->
 
 ## License
 
-<!-- TODO: add a LICENSE file and update this section -->
-
-This project is licensed under the [MIT License](./LICENSE).
+This project is licensed under the MIT License.
