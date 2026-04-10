@@ -2,317 +2,274 @@
 
 ## Overview
 
-Embedder Service is a FastAPI HTTP application that indexes source code repositories and provides semantic code search. The system extracts structured information from source files via per-language AST parsers, chunks code into semantically meaningful units enriched with import and call graph metadata, generates vector embeddings using either a local model (CodeBERT) or a cloud model (Voyage AI), and stores the results in PostgreSQL with the pgvector extension for efficient approximate-nearest-neighbour search.
+Embedder Service is an HTTP microservice that accepts text input and returns vector embeddings. It provides a simple, provider-agnostic REST API that abstracts over multiple embedding model backends (OpenAI, HuggingFace, local models). Downstream consumers — such as RAG pipelines, semantic search engines, and recommendation systems — can integrate with a single, stable API regardless of which embedding model is in use.
 
-```
-┌──────────────┐
-│   Client     │  HTTP (JSON)
-│  (Web UI /   │◄──────────────────────────────────────────┐
-│   curl / SDK)│──────────────────────────────────────────►│
-└──────┬───────┘                                           │
-       │                                                   │
-       ▼                                                   │
-┌──────────────┐      ┌──────────────┐      ┌────────────┐ │
-│   FastAPI    │      │   pgvector   │      │  Job Queue │ │
-│   main.py    │─────►│   db.py      │◄─────│  (in-proc) │ │
-│   Routes     │      │   store/     │      │  Webhooks  │ │
-└──────┬───────┘      └──────────────┘      └────────────┘ │
-       │                                                   │
-       ▼                                                   │
-┌──────────────┐      ┌──────────────┐      ┌────────────┐ │
-│   Indexing   │      │   Chunking   │      │  Embedding │ │
-│   Pipeline   │─────►│   lib/       │─────►│  lib/      │ │
-│   indexing/  │      │   chunker.py │      │  embedder  │ │
-└──────────────┘      └──────────────┘      └────────────┘ │
-       │                                                   │
-       ▼                                                   │
-┌──────────────┐      ┌──────────────┐                     │
-│    AST       │      │    Graph     │                     │
-│   Analyzers  │─────►│  lib/graph   │─────────────────────┘
-│   analyzers/ │      │              │  (enriches chunks
-│   utils/     │      └──────────────┘   before embedding)
-│  language_   │
-│  router.py   │
-└──────────────┘
+The service is designed to be lightweight, horizontally scalable, and easy to operate in containerised environments.
+
+```mermaid
+graph LR
+    Client[Client Application] -->|HTTP POST /v1/embed| API[API Layer]
+    API -->|Validate request| Validation[Request Validation]
+    Validation -->|Forward texts + config| Embedding[Embedding Engine]
+    Embedding -->|Route to provider| Provider[Model Provider]
+    Provider -->|Return vectors| Embedding
+    Embedding -->|Cache result| Cache[Cache Layer]
+    Embedding -->|Return response| API
+    API -->|JSON response| Client
+
+    subgraph Model Providers
+        OpenAI[OpenAI API]
+        HuggingFace[HuggingFace Inference]
+        Local[Local Model Runtime]
+    end
+
+    Provider --- OpenAI
+    Provider --- HuggingFace
+    Provider --- Local
 ```
 
-## Request Lifecycle
+## Component Breakdown
 
-### Indexing a Repository
+The service is composed of five core components:
 
-1. **Job creation** — The client submits a POST request to either `/embeddings/{namespace}/{project_id}` (zip upload) or `/github/index` (GitHub repo or local directory). The server creates a job record in the `jobs` table and returns the `job_id` immediately.
+### 1. API Layer
 
-2. **Background indexing** — The indexing pipeline runs synchronously within the request handler (not in a separate worker process). The pipeline executes these steps in order:
-   - **File discovery** (`utils/file_scanner.py`) — Recursively walks the repository, respecting `.gitignore` rules and applying language-specific filters to select indexable source files.
-   - **Language detection & analysis** (`utils/language_router.py` → `analyzers/`) — Each file is classified by language extension and dispatched to the appropriate analyzer. Analyzers produce `FileAnalysis` objects containing extracted symbols (functions, classes, imports, etc.).
-   - **Graph construction** (`lib/graph.py`) — Two graphs are built:
-     - **Import graph** — Maps each file to the set of files it imports (file-level dependency).
-     - **Call graph** — Maps each function/class to the set of symbols it references (symbol-level dependency).
-   - **Chunking** (`lib/chunker.py`) — Source code is split into semantically meaningful chunks (e.g., one per function/class). Each chunk receives a unique `chunk_id` and metadata including file path, symbol name, line number, chunk type, and extracted imports.
-   - **Graph enrichment** — Chunk metadata is augmented with related symbols from the import and call graphs, providing richer context for retrieval.
-   - **Embedding generation** (`lib/embedder.py`) — Chunks are embedded as dense vectors. The system automatically selects the embedding model:
-     - **Local**: `CodeEmbedder` using `microsoft/codebert-base` (768-dimensional) via HuggingFace transformers with masked mean pooling. Used when chunk count is below `LARGE_CODEBASE_THRESHOLD` (currently 99 999).
-     - **Cloud**: `VoyageEmbedder` using Voyage AI's `voyage-code-3` (1024-dimensional) API. Used for large codebases. Requires `VOYAGE_API_KEY`.
-   - **Vector storage** (`store/pgvector_store.py`) — Embeddings and their metadata are upserted into the `embeddings` table with `replace_all=True`, which removes stale vectors from previous indexing runs. An `index_meta` record captures the embedding model name, dimension, and cloud/local flag to enable correct model selection at query time.
+The HTTP server that receives client requests, validates input, and returns responses.
 
-3. **Job completion** — The job status is updated to `"completed"` (or `"failed"` on error), and a webhook notification is sent if `webhook_url` was provided. The total vector count is recorded on the job.
+- **Framework:** Go standard library `net/http` (with a lightweight router such as `chi` or `gorilla/mux`)
+- **Responsibilities:**
+  - Route incoming requests to the appropriate handler
+  - Parse and validate request bodies (JSON schema validation)
+  - Serialise responses with consistent error formatting
+  - Expose health (`/healthz`) and readiness (`/readyz`) endpoints
+  - Handle CORS, request timeouts, and graceful shutdown
+  <!-- TODO: confirm whether OpenAPI spec generation is desired -->
 
-### Searching Code
+### 2. Embedding Engine
 
-Two search endpoints are available:
+The core business logic that orchestrates embedding generation.
 
-- **`POST /search`** — Accepts a pre-computed embedding vector (`list[float]`) plus namespace/project ID and result count (`k`). The `PgVectorStore.search()` method performs a cosine similarity query against the `embeddings` table using the ivfflat index.
-- **`POST /search/text`** — Accepts raw query text. The server reads the `index_meta` record for the target project to determine which embedding model was used during indexing, instantiates the corresponding embedder, encodes the query, and delegates to the vector search path. This prevents dimension mismatches when the project was indexed with Voyage AI (1024-d) but the default CodeBERT model (768-d) would be used otherwise.
+- **Responsibilities:**
+  - Accept validated text inputs and model configuration
+  - Select the appropriate model provider based on the request or server defaults
+  - Optionally split inputs into provider-specific batch sizes
+  - Aggregate results from multiple batches
+  - Return normalised embedding vectors with metadata
+  - Handle provider failures with fallback logic (if configured)
 
-### Generating Embeddings
+### 3. Model Provider Abstraction
 
-`POST /embed` accepts arbitrary text and returns its embedding vector, using the local CodeBERT model by default. This is useful for pre-computing query embeddings on the client side.
+A pluggable interface that isolates the embedding engine from specific model APIs.
 
-## Data Model
+- **Interface:** All providers implement a common `Embedder` interface:
 
-### Tables
+  ```go
+  // Embedder generates vector embeddings for a list of texts.
+  type Embedder interface {
+      // Embed returns embeddings for the given texts.
+      Embed(ctx context.Context, texts []string, opts EmbedOptions) (*EmbedResult, error)
 
-#### `jobs`
+      // ModelInfo returns metadata about the model (name, dimensions, max tokens).
+      ModelInfo() ModelInfo
+  }
+  ```
 
-Tracks indexing operations and their lifecycle.
+- **Concrete providers:**
+  - `OpenAIEmbedder` — Calls the [OpenAI Embeddings API](https://platform.openai.com/docs/api-reference/embeddings) (`text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002`)
+  - `HuggingFaceEmbedder` — Calls the [HuggingFace Inference API](https://huggingface.co/docs/api-inference) for hosted sentence-transformer models
+  - `LocalEmbedder` — Loads a HuggingFace model (e.g., via ONNX Runtime or a Go-native runtime) for offline inference
+  <!-- TODO: evaluate additional providers (Cohere, Voyage AI, Azure OpenAI) -->
 
-| Column | Type | Description |
-|---|---|---|
-| `job_id` | `TEXT PK` | Unique job identifier (UUID) |
-| `namespace` | `TEXT` | Tenant/project namespace |
-| `project_id` | `TEXT` | Project identifier within the namespace |
-| `filename` | `TEXT` | Original filename or repo identifier |
-| `status` | `TEXT` | Job status: `queued`, `processing`, `completed`, `failed` |
-| `source` | `TEXT` | Source type: `github`, `upload`, `local` |
-| `owner` | `TEXT` | Repository owner (GitHub sources) |
-| `repo` | `TEXT` | Repository name (GitHub sources) |
-| `ref` | `TEXT` | Git reference (branch/tag/commit) |
-| `total_vectors` | `INTEGER` | Number of vectors stored |
-| `persist_dir` | `TEXT` | Local persist directory path (legacy) |
-| `embedder` | `TEXT` | Embedder class name used |
-| `webhook_url` | `TEXT` | URL for completion notifications |
-| `error` | `TEXT` | Error message (if failed) |
-| `created_at` | `TIMESTAMPTZ` | Job creation timestamp |
-| `updated_at` | `TIMESTAMPTZ` | Last update timestamp |
+### 4. Cache Layer
 
-#### `embeddings`
+An optional caching layer to avoid re-computing embeddings for identical inputs.
 
-Stores vector embeddings with their associated code chunk metadata.
+- **Backends:**
+  - **In-memory** — Simple LRU cache for single-instance deployments (default)
+  - **Redis** — Distributed cache for multi-instance deployments
+- **Cache key:** Hash of `(model_id, text, dimensions)` to ensure correctness
+- **TTL:** Configurable, defaults to 1 hour
+- <!-- TODO: decide whether cache warming or pre-population is needed -->
 
-| Column | Type | Description |
-|---|---|---|
-| `id` | `BIGSERIAL PK` | Auto-incrementing row ID |
-| `namespace` | `TEXT` | Tenant namespace |
-| `project_id` | `TEXT` | Project identifier |
-| `chunk_id` | `TEXT` | Unique chunk identifier (function name, class name, etc.) |
-| `file_path` | `TEXT` | Relative source file path |
-| `chunk_type` | `TEXT` | Type: `function`, `class`, `module` |
-| `symbol_name` | `TEXT` | Primary symbol name |
-| `line_number` | `INTEGER` | Start line of the chunk in the source file |
-| `content` | `TEXT` | Source code text of the chunk |
-| `metadata` | `JSONB` | Additional metadata (imports, called functions, graph data) |
-| `embedding` | `vector(768)` | Dense embedding vector |
-| `created_at` | `TIMESTAMPTZ` | Insertion timestamp |
+### 5. Configuration
 
-**Unique constraint**: `(namespace, project_id, chunk_id)` — ensures one embedding per chunk per project.
+Manages service settings from environment variables and/or config files.
 
-**Index**: `embeddings_vec_idx` — ivfflat index on the `embedding` column using `vector_cosine_ops` for approximate nearest-neighbour search.
+- **Sources** (in order of precedence):
+  1. Environment variables
+  2. Configuration file (`config.yaml` in the working directory)
+  3. Built-in defaults
+- **Hot-reload:** <!-- TODO: decide whether config hot-reload is needed -->
+- Settings include: listen address, default model, dimensions, cache config, provider API keys, and logging level.
 
-#### `index_meta`
-
-Records which embedding model was used for a project's index.
-
-| Column | Type | Description |
-|---|---|---|
-| `namespace` | `TEXT PK` | Tenant namespace |
-| `project_id` | `TEXT PK` | Project identifier |
-| `embedder` | `TEXT` | Embedder class name: `CodeEmbedder` or `VoyageEmbedder` |
-| `model` | `TEXT` | Model name: `microsoft/codebert-base` or `voyage-code-3` |
-| `embedding_dim` | `INTEGER` | Vector dimension: 768 (local) or 1024 (cloud) |
-| `use_cloud` | `BOOLEAN` | Whether cloud embedding was used |
-| `created_at` | `TIMESTAMPTZ` | Index creation timestamp |
-| `updated_at` | `TIMESTAMPTZ` | Last re-index timestamp |
-
-### Data Flow Diagram
+## Data Flow
 
 ```
-Repository (zip / git clone / local dir)
-        │
-        ▼
-  File Discovery ──── scan_repository()
-        │              • Recursive walk
-        │              • .gitignore filtering
-        │              • Language extension filtering
-        ▼
-  Language Detection ── analyze_file()
-        │              • Extension → language mapping
-        │              • Analyzer dispatch
-        ▼
-  AST Analysis ────── analyzers/*.py
-        │              • Function extraction
-        │              • Class extraction
-        │              • Import collection
-        │              • Docstring extraction
-        ▼
-  FileAnalysis objects (list)
-        │
-        ├──► Import Graph ──── build_import_graph()
-        │       • file → set[imported_files]
-        │
-        ├──► Call Graph ───── build_call_graph()
-        │       • symbol → set[called_symbols]
-        │
-        ▼
-  Code Chunking ───── chunk_repository_analyses()
-        │              • One chunk per function/class
-        │              • Module-level chunks for top-level code
-        │              • Metadata: file_path, symbol, line, imports
-        ▼
-  Graph Enrichment ── enrich_chunks_with_graph()
-        │              • Add related symbols from import graph
-        │              enrich_chunks_with_call_graph()
-        │              • Add called functions from call graph
-        ▼
-  List[Dict] chunks
-        │
-        ▼
-  Embedding ────────── CodeEmbedder / VoyageEmbedder
-        │              • encode(texts) → np.ndarray (float32)
-        │              • Batched processing
-        ▼
-  List[Dict] chunks with "embedding" key
-        │
-        ▼
-  pgvector Storage ── PgVectorStore.add_vectors()
-                       • Upsert embeddings table
-                       • Update index_meta
-                       • Return vector count
+┌──────────┐      ┌──────────────┐      ┌────────────────┐      ┌──────────────┐      ┌──────────────┐
+│  Client   │─────►│  API Layer   │─────►│   Request      │─────►│  Embedding   │─────►│  Model       │
+│           │      │  (HTTP)      │      │   Validation   │      │  Engine      │      │  Provider    │
+└──────────┘      └──────────────┘      └────────────────┘      └──────────────┘      └──────────────┘
+                                                                                             │
+                                                                                             ▼
+┌──────────┐      ┌──────────────┐      ┌────────────────┐      ┌──────────────┐      ┌──────────────┐
+│  Client   │◄─────│  API Layer   │◄─────│   Response     │◄─────│  Embedding   │◄─────│  Vectors     │
+│           │      │  (JSON)      │      │   Serialiser   │      │  Engine      │      │  (float[])   │
+└──────────┘      └──────────────┘      └────────────────┘      └──────────────┘      └──────────────┘
 ```
 
-## Component Details
+### Step-by-step
 
-### `main.py` — FastAPI Application & HTTP Routes
+1. **Request received** — The API layer receives a `POST /v1/embed` request with a JSON body containing `texts`, an optional `model`, and optional `dimensions`.
 
-The single-file web server that:
-- Creates the FastAPI app and configures CORS.
-- Initialises the database schema via `db.init_db()` on startup.
-- Defines all HTTP route handlers for indexing, searching, embedding generation, and job status.
-- Handles authentication via `Authorization: Bearer` tokens.
-- Processes zip file uploads, GitHub repository cloning (via subprocess calls to `git`), and local directory indexing.
-- Constructs the indexing pipeline (calling into `indexing/full_pipeline.py`) and the search pipeline (calling into `store/pgvector_store.py` and `lib/embedder.py`).
-- Sends webhook notifications on job completion with HMAC-SHA256 signatures.
-- Serves the static web UI from `web/index.html` at the root path.
+2. **Validation** — The request body is validated:
+   - `texts` must be a non-empty array of strings.
+   - Each text must not exceed the model's maximum input token length.
+   - `dimensions` (if provided) must be within the model's supported range.
+   - On failure, a `400 INVALID_REQUEST` error is returned immediately.
 
-### `db.py` — Database Layer
+3. **Cache lookup** — If caching is enabled, the cache is queried for each input text using a key derived from `(model, text, dimensions)`. Cached results are returned without calling the provider.
 
-- Manages a `ThreadedConnectionPool` backed by `psycopg2`.
-- Provides `init_db()` which creates the `vector` extension and all tables/indexes.
-- Handles the `DATABASE_URL` / `LOCAL_DATABASE_URL` fallback chain.
-- Automatically appends `sslmode=require` for production connections.
-- Includes a migration that drops and recreates the `embeddings` table if the vector dimension is not 768 (to handle past schemas with wrong dimensions).
-- Exposes CRUD functions: `create_job`, `update_job`, `get_job`, `upsert_index_meta`, `get_index_meta`, `delete_embeddings`, `count_embeddings`.
+4. **Provider selection** — The embedding engine resolves the requested model to a configured provider. If no model is specified, the server default is used. If the model is not available, a `422 MODEL_NOT_FOUND` error is returned.
 
-### `analyzers/` — Per-Language AST Analysis
+5. **Batch embedding** — The provider's `Embed()` method is called with the validated texts (minus any cache hits). The provider may internally batch the request if it exceeds its per-request limit.
 
-Each analyzer module exports an `analyze_file(file_path: str) -> FileAnalysis` function. The `FileAnalysis` dataclass contains:
+6. **Response construction** — The embedding engine assembles the response:
+   - Merges cache hits with fresh provider results.
+   - Returns the embeddings in the same order as the input texts.
+   - Attaches model metadata and usage information.
 
-- `file_path`: Relative path to the source file.
-- `language`: Detected programming language.
-- `functions`: List of `FunctionInfo` objects (name, parameters, return type, docstring, line range).
-- `classes`: List of `ClassInfo` objects (name, methods, docstring, line range).
-- `imports`: List of imported module/symbol names.
-- `symbols`: Flat list of all top-level symbol names.
+7. **Cache write** — Fresh results are written to the cache with the configured TTL.
 
-**Python** (`python_analyzer.py`) uses the built-in `ast` module. All other languages use [tree-sitter](https://tree-sitter.github.io/) grammars for robust parsing.
+8. **Response sent** — The API layer serialises the response as JSON and returns it to the client with a `200 OK` status.
 
-### `utils/language_router.py` — Language Detection & Dispatch
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API Layer
+    participant V as Validator
+    participant E as Embedding Engine
+    participant Ca as Cache
+    participant P as Model Provider
 
-Maps file extensions to analyzer modules and language names. Provides the `analyze_file(file_path: str) -> FileAnalysis | None` entry point that all indexing code uses.
-
-### `utils/file_scanner.py` — File Discovery
-
-Recursively scans a directory for source files, applying filters:
-- Respects `.gitignore` rules (via `pathspec` library).
-- Filters by a configurable set of indexable file extensions.
-- Skips common non-code directories (`node_modules`, `__pycache__`, `.git`, `venv`, etc.).
-
-### `lib/chunker.py` — Code Chunking
-
-Converts `FileAnalysis` objects into embedding-ready chunks. Each function and class becomes a separate chunk with its source code as the `content` field. Module-level code (outside any function/class) is captured as a "module" chunk. Metadata includes file path, symbol name, line number, chunk type, and extracted imports.
-
-### `lib/graph.py` — Import & Call Graphs
-
-- **`build_import_graph(analyses)`** — Constructs a dictionary mapping each file path to the set of file paths it imports. Uses the imports extracted during AST analysis and resolves them against the scanned file list.
-- **`build_call_graph(analyses)`** — Constructs a dictionary mapping each symbol name to the set of symbol names it references (calls, instantiates, or accesses). Uses a combination of AST-based reference extraction and heuristic name matching.
-- **`enrich_chunks_with_graph(chunks, import_graph)`** — Adds an `imported_files` field to each chunk's metadata listing the files that the chunk's source file imports.
-- **`enrich_chunks_with_call_graph(chunks, call_graph)`** — Adds a `called_functions` field to each chunk's metadata listing the symbols referenced by the chunk.
-
-### `lib/embedder.py` — Embedding Models
-
-- **`CodeEmbedder`** — Local embedding using HuggingFace transformers. Loads `AutoTokenizer` and `AutoModel`, encodes text with masked mean pooling and L2 normalisation. Falls back to `SentenceTransformer` for non-CodeBERT models. Gracefully degrades to random embeddings if models fail to load.
-- **`VoyageEmbedder`** — Cloud embedding via Voyage AI REST API. Batches requests (up to 128 texts per request) and returns 1024-dimensional embeddings. Requires `VOYAGE_API_KEY`.
-- **Model selection** — The pipeline compares the chunk count against `LARGE_CODEBASE_THRESHOLD` to decide which embedder to use. This decision and the resulting model metadata are persisted in `index_meta` so that the search endpoint can recreate the correct embedder.
-
-### `store/pgvector_store.py` — Vector Storage
-
-Wraps PostgreSQL/pgvector operations for the indexing and search paths:
-
-- **`add_vectors(embeddings, metadata, replace_all=True)`** — When `replace_all=True`, deletes all existing vectors for the namespace/project before inserting. This ensures a clean index on each re-run without stale chunks from deleted or renamed files.
-- **`search(query_vector, k)`** — Performs a cosine similarity query using the ivfflat index and returns the top-k results with their metadata and similarity scores.
-
-### `store/chroma_store.py` — Alternative Vector Storage
-
-Provides a ChromaDB-backed vector store as an alternative to pgvector. Used by the `full_pipeline_chroma()` pipeline. Stores call and import graphs as pickle files alongside the Chroma directory.
-
-### `store/project_store.py` — JSON Project Records
-
-Simple file-based store for project metadata, used by the Chroma pipeline.
-
-### `indexing/full_pipeline.py` — Pipeline Orchestration
-
-Exposes two high-level functions:
-
-- **`full_pipeline_pgvector(repo_path, namespace, project_id, ...)`** — End-to-end indexing into pgvector. Returns the store, call graph, import graph, and index metadata.
-- **`full_pipeline_chroma(repo_path, chroma_dir, ...)`** — End-to-end indexing into ChromaDB. Returns the store, call graph, and import graph. Also persists graphs and index metadata as local files.
-
-Both follow the same internal steps (file discovery → analysis → graphs → chunking → enrichment → embedding → storage) but differ in where the final vectors are stored.
-
-## Embedding Model Selection
-
-```
-chunks.length > LARGE_CODEBASE_THRESHOLD?
-       │
-       ├── YES ──► VoyageEmbedder (cloud)
-       │           • voyage-code-3 model
-       │           • 1024 dimensions
-       │           • Requires VOYAGE_API_KEY
-       │           • Batched API calls (128 per request)
-       │
-       └── NO  ──► CodeEmbedder (local)
-                   • microsoft/codebert-base model
-                   • 768 dimensions
-                   • No external dependencies
-                   • GPU-accelerated when available
+    C->>A: POST /v1/embed {texts, model, dimensions}
+    A->>V: Validate request body
+    V-->>A: Validation result (pass/fail)
+    alt Validation fails
+        A-->>C: 400 INVALID_REQUEST
+    end
+    A->>E: GenerateEmbeddings(texts, opts)
+    E->>Ca: Check cache for each text
+    Ca-->>E: Cache hits (if any)
+    E->>P: Embed(ctx, uncached_texts, opts)
+    P-->>E: Embeddings + usage metadata
+    E->>Ca: Store fresh results in cache
+    E-->>A: EmbedResult {embeddings, model, usage}
+    A-->>C: 200 OK {model, dimensions, embeddings, usage}
 ```
 
-The chosen model and its dimension are recorded in `index_meta` so that `/search/text` can instantiate the correct embedder at query time, preventing dimension-mismatch errors.
+## Technology Choices
 
-## Authentication
+<!-- TODO: confirm the tech stack with the team before implementation begins -->
 
-API endpoints (except `/search`, `/search/text`, `/embed`, and the web UI) require an `Authorization: Bearer <token>` header. Token validation is performed in the route handlers.
+| Component | Proposed Choice | Rationale | Alternatives Considered |
+|---|---|---|---|
+| **Language** | Go 1.22+ | Fast compilation, single binary deployment, excellent concurrency support, low memory footprint | Python (rich ML ecosystem but heavier runtime), Rust (maximal performance but steeper learning curve) |
+| **HTTP Framework** | `net/http` + `chi` router | Go standard library for transport; `chi` adds lightweight routing, middleware, and context support without bloat | `gorilla/mux` (unmaintained), `gin` (more opinionated), `fiber` (requires different ecosystem) |
+| **Model Provider — Cloud** | OpenAI Embeddings API | Industry-standard, high quality, well-documented, supports dimension truncation | HuggingFace Inference API, Cohere, Voyage AI |
+| **Model Provider — Local** | ONNX Runtime (via `onnxruntime-go`) | Cross-platform, fast CPU/GPU inference, wide model support | Python subprocess (adds complexity), CGo bindings for C++ runtimes |
+| **Vector Cache** | In-memory LRU (default), Redis (distributed) | Zero dependencies for single-instance; Redis for production scale | Memcached (no native TTL-per-key), BadgerDB (embedded but overkill) |
+| **Configuration** | Environment variables + YAML file | 12-factor app compliance; file-based config for complex deployments | TOML, JSON (less human-readable), Viper (adds dependency weight) |
+| **Logging** | `log/slog` (Go 1.21+) | Structured logging in the standard library; no third-party dependency | `zap` (faster but external), `zerolog` (external) |
+| **Testing** | `testing` stdlib + `testify` | Standard library foundation; `testify` for assertions and mocks | `gomock` (generated mocks), `mockery` (more boilerplate) |
 
-Webhook notifications are signed with HMAC-SHA256 using the `WEBHOOK_SECRET` environment variable. The `X-Signature-256` header contains the hex-encoded digest, computed over the JSON response body. Recipients can verify authenticity by recomputing the digest with the shared secret.
+## Directory Structure
 
-## Webhooks
+<!-- TODO: adjust as the implementation evolves -->
 
-When a job completes (success or failure) and a `webhook_url` was provided, the service sends a POST request with:
+```
+embedder-service/
+├── cmd/
+│   └── server/
+│       └── main.go                 # Application entry point
+├── internal/
+│   ├── api/
+│   │   ├── handler.go              # HTTP route handlers
+│   │   ├── middleware.go           # CORS, logging, auth middleware
+│   │   ├── request.go              # Request types and validation
+│   │   └── response.go             # Response types and serialisation
+│   ├── embedder/
+│   │   ├── engine.go               # Embedding engine (orchestration)
+│   │   ├── embedder.go             # Embedder interface definition
+│   │   ├── openai.go               # OpenAI provider implementation
+│   │   ├── huggingface.go          # HuggingFace provider implementation
+│   │   ├── local.go                # Local model provider implementation
+│   │   └── registry.go             # Model name → provider registry
+│   ├── cache/
+│   │   ├── cache.go                # Cache interface
+│   │   ├── memory.go               # In-memory LRU cache
+│   │   └── redis.go                # Redis cache implementation
+│   └── config/
+│       ├── config.go               # Configuration struct and loader
+│       └── defaults.go             # Default values
+├── pkg/
+│   └── logger/
+│       └── logger.go               # Shared structured logger setup
+├── configs/
+│   └── config.yaml                 # Example configuration file
+├── docs/
+│   ├── api.yaml                    # OpenAPI / Swagger specification
+│   └── architecture.md             # This file
+├── scripts/
+│   └── dev.sh                      # Local development helper script
+├── go.mod                          # Go module definition
+├── go.sum                          # Dependency checksums
+├── Dockerfile                      # Container build
+├── .dockerignore                   # Docker build exclusions
+├── .gitignore                      # Git exclusions
+├── Makefile                        # Build, test, lint targets
+├── README.md                       # Project overview and usage
+└── LICENSE                         # License file
+```
 
-- **Headers**: `Content-Type: application/json`, `X-Signature-256: <hmac-sha256-hex>`
-- **Body**: JSON containing `job_id`, `status`, `total_vectors`, `error` (if any), and other job fields.
+### Key Design Decisions
 
-## Error Handling
+- **`cmd/`** contains the application entry points. Multiple binaries (e.g., `server`, `migrate`) can live here.
+- **`internal/`** holds all private application code that cannot be imported by external Go modules. This is where the core business logic lives.
+- **`pkg/`** contains packages that could potentially be reused by other projects (e.g., a shared logger or utility library).
+- **`configs/`** stores configuration files and templates, separate from source code.
+- **`docs/`** holds documentation assets like the OpenAPI spec.
+- <!-- TODO: add a `test/` or `testdata/` directory for integration test fixtures -->
 
-- **Indexing failures** are caught at the pipeline level, the job status is set to `"failed"`, and the error message is stored in the `jobs.error` column.
-- **Embedding model load failures** fall back to random embeddings (local embedder) or raise a clear error (cloud embedder requiring API key).
-- **Database dimension migrations** are handled automatically: if the `embeddings` table has the wrong vector dimension, it is dropped and recreated on `init_db()`.
-- **ChromaDB SQLITE_READONLY_DBMOVED** is avoided by using `replace_all=True` upserts instead of `clear()` + `add_vectors()` (which triggers SQLite VACUUM file renaming).
+## Deployment Considerations
+
+<!-- TODO: expand this section based on the team's infrastructure -->
+
+### Horizontal Scaling
+
+The stateless API design allows multiple instances to run behind a load balancer. For distributed caching, configure Redis as the cache backend.
+
+### Resource Requirements
+
+<!-- TODO: profile and document actual resource usage -->
+
+- **CPU:** Minimal for API and orchestration; depends on local model inference if enabled
+- **Memory:** ~50 MB base; increases with cache size and loaded models
+- **Network:** Outbound HTTPS to model provider APIs; no inbound dependencies
+
+### Observability
+
+<!-- TODO: add Prometheus metrics and distributed tracing once implementation begins -->
+
+- Structured JSON logs via `log/slog`
+- Health and readiness probes for container orchestrators
+- <!-- TODO: add Prometheus `/metrics` endpoint -->
+- <!-- TODO: add OpenTelemetry trace propagation -->
+
+## Security Considerations
+
+<!-- TODO: expand based on the team's security requirements -->
+
+- **API keys** — Provider API keys are loaded from environment variables and never exposed in responses or logs.
+- **Input sanitisation** — Text inputs are validated for length and encoding before being passed to embedding providers.
+- **Rate limiting** — <!-- TODO: implement rate limiting middleware -->
+- **TLS** — <!-- TODO: document TLS termination strategy (reverse proxy vs built-in) -->
