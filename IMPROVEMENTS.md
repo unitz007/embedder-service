@@ -2,31 +2,149 @@
 
 This document catalogues actionable improvements and known limitations across
 the indexing and analysis codebase.  Each entry includes the **why**, a
-suggested approach, and the files that would need to change.
+suggested approach, the files that would need to change, and an
+**effort-impact rating**.
 
 ---
 
 ## Table of Contents
 
-1. [Python Analyzer](#1-python-analyzer)
-2. [Go Analyzer](#3-go-analyzer)
-3. [JavaScript Analyzer](#4-javascript-analyzer)
-4. [Generic Tree-Sitter Analyzer](#5-generic-tree-sitter-analyzer)
-5. [Shell Analyzer](#6-shell-analyzer)
-6. [Config Analyzer](#7-config-analyzer)
-7. [Language Router](#8-language-router)
-8. [Models & Data Layer](#9-models--data-layer)
-9. [Indexing Pipeline](#10-indexing-pipeline)
-10. [Search & Retrieval](#11-search--retrieval)
-11. [LLM Integration](#12-llm-integration)
-12. [Testing](#13-testing)
-13. [Operational & DevEx](#14-operational--devex)
+1. [Innovative & Forward-Looking Proposals](#1-innovative--forward-looking-proposals)
+2. [Python Analyzer](#2-python-analyzer)
+3. [Go Analyzer](#3-go-analyzer)
+4. [JavaScript Analyzer](#4-javascript-analyzer)
+5. [Generic Tree-Sitter Analyzer](#5-generic-tree-sitter-analyzer)
+6. [Shell Analyzer](#6-shell-analyzer)
+7. [Config Analyzer](#7-config-analyzer)
+8. [Language Router](#8-language-router)
+9. [Models & Data Layer](#9-models--data-layer)
+10. [Indexing Pipeline](#10-indexing-pipeline)
+11. [Search & Retrieval](#11-search--retrieval)
+12. [LLM Integration](#12-llm-integration)
+13. [Testing](#13-testing)
+14. [Operational & DevEx](#14-operational--devex)
 
 ---
 
-## 1. Python Analyzer
+## 1. Innovative & Forward-Looking Proposals
 
-### 1.1. Decorator extraction
+### 1.1. Semantic caching layer for embedding reuse
+*[Impact: High | Effort: Medium]*
+
+**Problem:** During re-indexing, unchanged code chunks are re-embedded every
+time. For a 10,000-chunk codebase where only 200 files changed, this wastes
+~95% of embedding compute and, when using the Voyage AI cloud embedder,
+unnecessary API spend.
+
+**Approach:** Maintain a content-hash → embedding cache (backed by the
+existing Postgres store or a Redis sidecar). Before calling the embedder,
+compute a SHA-256 hash of each chunk's `content` field and look it up in
+the cache. On a cache hit, reuse the previous embedding vector without
+calling the model. On a miss, embed normally and store the result keyed by
+hash. This turns incremental indexing (§10.1) from "skip files with
+unchanged hashes" into "skip individual *chunks* with unchanged content,"
+which is more granular — a file where only one function changed reuses
+embeddings for every other function.
+
+**Files:** `lib/embedder.py` (add cache layer in `CodeEmbedder.encode` and
+`VoyageEmbedder.encode`), `db.py` (new `embedding_cache` table), `indexing/full_pipeline.py`
+
+### 1.2. Per-tenant model routing
+*[Impact: High | Effort: Low]*
+
+**Problem:** The multi-tenancy model already scopes all data by
+`(namespace, project_id)` via `store/pgvector_store.py`, but model selection
+in `indexing/full_pipeline.py` is purely based on codebase size
+(`len(chunks) > LARGE_CODEBASE_THRESHOLD`). A paying customer who wants
+Voyage AI embeddings for a small-but-critical codebase has no way to
+override this, and a cost-sensitive tenant with a large codebase cannot opt
+out of the cloud embedder.
+
+**Approach:** Add an optional `preferred_embedder` column to the
+`index_meta` table (`db.py`). When set (e.g. `"voyage-code-3"` or
+`"microsoft/codebert-base"`), the pipeline uses that model regardless of
+chunk count. When unset, the existing size-based heuristic applies. Expose
+this via a `PUT /embeddings/{ns}/{pid}/config` endpoint in `main.py` that
+accepts `{"preferred_embedder": "voyage-code-3"}` and stores it in
+`index_meta`. This lets each tenant self-serve their embedding quality vs.
+cost trade-off without any service restart or configuration file change.
+
+**Files:** `db.py`, `indexing/full_pipeline.py`, `main.py`,
+`store/pgvector_store.py`
+
+### 1.3. Embedding cost attribution per tenant
+*[Impact: Medium | Effort: Low]*
+
+**Problem:** When using the Voyage AI cloud embedder, there is no tracking of
+how many tokens or characters each tenant consumes. With multiple namespaces
+and projects, it is impossible to attribute API costs back to specific
+customers or teams, making pricing and budgeting opaque.
+
+**Approach:** In `VoyageEmbedder.encode` (`lib/embedder.py`), accumulate
+total character count per call and emit a structured log line with
+`namespace`, `project_id`, `model`, `character_count`, and `timestamp`.
+Store these records in a new `embedding_usage` table in `db.py` with
+`(namespace, project_id, month)` granularity. Expose a
+`GET /embeddings/{ns}/{pid}/usage` endpoint that returns cumulative
+character/token counts and an estimated cost (based on Voyage AI's published
+per-token pricing). This enables the operator to bill per-tenant and set
+budget alerts.
+
+**Files:** `lib/embedder.py`, `db.py`, `main.py`
+
+### 1.4. RAG pipeline hooks (pre/post indexing)
+*[Impact: High | Effort: Medium]*
+
+**Problem:** The indexing pipeline in `indexing/full_pipeline.py` is a fixed
+sequence: scan → analyze → chunk → embed → store. External systems that
+need to inject custom processing — such as PII scrubbing before embedding,
+domain-specific custom chunking strategies, watermarking metadata, or
+triggering downstream ML pipelines — have no integration point.
+
+**Approach:** Introduce a lightweight hook system into the pipeline. Define
+two hook points — `pre_embed(chunks)` and `post_store(store, metadata)` —
+as Python callables registered via a simple plugin discovery mechanism (e.g.
+`entry_points` in `pyproject.toml` or a `hooks/` directory with convention
+over configuration). Each hook receives and returns the pipeline's data,
+enabling transformation, filtering, or enrichment. For example, a PII hook
+could scan chunk content for social security numbers and redact them before
+embedding. A domain hook for a medical codebase could inject ICD code
+annotations into chunk metadata. The hooks run in order and are fully
+optional — without any hooks registered, the pipeline behaves exactly as
+today.
+
+**Files:** `indexing/full_pipeline.py` (new `PipelineHooks` class), new
+`hooks/` directory, `pyproject.toml`
+
+### 1.5. Streaming search endpoint
+*[Impact: Medium | Effort: Medium]*
+
+**Problem:** The `POST /search/text` endpoint in `main.py` blocks until all
+k results are scored and returned. For queries that trigger a large vector
+scan (high k, many candidate chunks), the client waits with no feedback.
+This is particularly noticeable for the pgvector store where the cosine
+similarity computation happens server-side.
+
+**Approach:** Add a `POST /search/stream` endpoint that uses Server-Sent
+Events (SSE) to return results incrementally. As each result is scored
+above a configurable similarity threshold, it is pushed to the client
+immediately rather than waiting for the full top-k set. The client sees
+results arriving one-by-one, starting with the highest-similarity match,
+which dramatically improves perceived latency. This requires converting
+the synchronous `PgVectorStore.search` method to an async generator or
+using a background thread with a shared queue. The Chroma store path can
+follow the same pattern.
+
+**Files:** `main.py` (new SSE endpoint), `store/pgvector_store.py` (async or
+threaded search variant), `store/chroma_store.py`
+
+---
+
+## 2. Python Analyzer
+
+### 2.1. Decorator extraction
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** Decorators (`@staticmethod`, `@property`, `@abstractmethod`,
 `@app.route`, custom decorators) are completely ignored.  They carry
 important semantic information such as framework routing, access control,
@@ -39,7 +157,9 @@ List[str]` field to `FunctionInfo`.  Preserve order so that
 
 **Files:** `analyzers/python_analyzer.py`, `models.py`
 
-### 1.2. Nested class support
+### 2.2. Nested class support
+*[Impact: Low | Effort: Low]*
+
 **Problem:** Only top-level `ast.ClassDef` nodes are visited.  Classes
 defined inside other classes or inside functions are missed entirely.
 
@@ -49,7 +169,9 @@ enclosing class (`Outer.Inner`).
 
 **Files:** `analyzers/python_analyzer.py`
 
-### 1.3. Type alias and TypedDict extraction
+### 2.3. Type alias and TypedDict extraction
+*[Impact: Low | Effort: Medium]*
+
 **Problem:** `TypeAlias`, `NamedTuple`, `Protocol`, and `TypedDict`
 assignments (e.g. `MyType = Union[int, str]`) are not captured.
 
@@ -59,7 +181,9 @@ assignments (e.g. `MyType = Union[int, str]`) are not captured.
 
 **Files:** `analyzers/python_analyzer.py`
 
-### 1.4. Package name reliability
+### 2.4. Package name reliability
+*[Impact: Low | Effort: Low]*
+
 **Problem:** `_get_package` walks upward looking for `__init__.py`.  It
 fails for namespace packages (PEP 420), standalone scripts, and
 directories that happen to lack `__init__.py` (e.g. some test fixtures).
@@ -70,7 +194,9 @@ provided, keep the current heuristic but mark the result as
 
 **Files:** `analyzers/python_analyzer.py`
 
-### 1.5. Import alias handling
+### 2.5. Import alias handling
+*[Impact: Low | Effort: Low]*
+
 **Problem:** `import numpy as np` records `"numpy"` but discards the
 alias `"np"`.  `from os.path import join as path_join` records only
 `"os.path"`.
@@ -81,7 +207,9 @@ only need the local name.
 
 **Files:** `analyzers/python_analyzer.py`
 
-### 1.6. Error-tolerant parsing
+### 2.6. Error-tolerant parsing
+*[Impact: High | Effort: Medium]*
+
 **Problem:** A `SyntaxError` causes the entire file to return an empty
 analysis.  Files with partial syntax errors (e.g. a missing closing
 parenthesis on one line) yield nothing.
@@ -95,9 +223,11 @@ error-tolerant parsing.
 
 ---
 
-## 2. Go Analyzer
+## 3. Go Analyzer
 
-### 2.1. Test function detection
+### 3.1. Test function detection
+*[Impact: Low | Effort: Low]*
+
 **Problem:** Functions named `TestFoo` in `_test.go` files are treated
 identically to production code.  No `kind` or annotation distinguishes
 benchmarks (`BenchmarkFoo`) or fuzz targets (`FuzzFoo`).
@@ -108,7 +238,9 @@ Detect `Test`, `Benchmark`, `Example`, and `Fuzz` prefixes and the
 
 **Files:** `analyzers/go_analyzer.py`
 
-### 2.2. Interface embedding resolution
+### 3.2. Interface embedding resolution
+*[Impact: Medium | Effort: High]*
+
 **Problem:** When an interface embeds another (`type Foo interface { Bar }`),
 the embedded methods are not listed under `Foo`.
 
@@ -118,7 +250,9 @@ analysis or at least single-file multi-pass resolution.
 
 **Files:** `analyzers/go_analyzer.py`
 
-### 2.3. Generic type parameter extraction
+### 3.3. Generic type parameter extraction
+*[Impact: Low | Effort: Low]*
+
 **Problem:** Go 1.18+ type parameters (`[T any]`) are silently dropped
 from type declarations and function signatures.
 
@@ -128,7 +262,9 @@ a dedicated `type_params` field.
 
 **Files:** `analyzers/go_analyzer.py`
 
-### 2.4. Struct tag extraction
+### 3.4. Struct tag extraction
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** Struct field tags (`json:"name,omitempty"`) are not captured,
 even though they are critical for serialization, validation, and ORM
 mapping.
@@ -139,7 +275,9 @@ new `fields` list on `ClassInfo` or in `metadata`.
 
 **Files:** `analyzers/go_analyzer.py`, `models.py`
 
-### 2.5. Constant and variable extraction
+### 3.5. Constant and variable extraction
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** `const` and `var` blocks are ignored.  Package-level
 identifiers with significant values (e.g. API version strings, default
 configs) are invisible to search.
@@ -152,9 +290,11 @@ with a `kind="const"` / `kind="var"` tag.  Walk `const_declaration` /
 
 ---
 
-## 3. JavaScript Analyzer
+## 4. JavaScript Analyzer
 
-### 3.1. TypeScript support
+### 4.1. TypeScript support
+*[Impact: High | Effort: Medium]*
+
 **Problem:** The analyzer uses `tree_sitter_javascript`.  TypeScript
 files (`.ts`, `.tsx`) are not handled.
 
@@ -164,9 +304,11 @@ parallel or unified analyzer that handles TypeScript-specific node types
 `abstract_class_declaration`, `as_expression`, etc.).
 
 **Files:** `analyzers/js_analyzer.py`, `analyzers/ts_analyzer.py` (new),
-`language_router.py`
+`utils/language_router.py`
 
-### 3.2. React / JSX component extraction
+### 4.2. React / JSX component extraction
+*[Impact: Medium | Effort: Medium]*
+
 **Problem:** React functional components (`export default function App()`) are
 recognized as plain functions.  Class components and JSX are not
 distinguished.
@@ -177,7 +319,9 @@ or `extends Component` in the heritage clause.
 
 **Files:** `analyzers/js_analyzer.py`
 
-### 3.3. Destructured exports
+### 4.3. Destructured exports
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** `export { foo, bar }` and `export { default as Alias }` are
 missed because the analyzer only handles `export_statement` with a
 `declaration` field.
@@ -187,7 +331,9 @@ Record each exported name and its local binding.
 
 **Files:** `analyzers/js_analyzer.py`
 
-### 3.4. Async function detection
+### 4.4. Async function detection
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** `async function` and `async arrow` are not tagged, losing
 concurrency information that is important for understanding application
 behavior.
@@ -198,7 +344,9 @@ context.  Add an `is_async` flag to `FunctionInfo`.
 
 **Files:** `analyzers/js_analyzer.py`, `models.py`
 
-### 3.5. Default vs named export distinction
+### 4.5. Default vs named export distinction
+*[Impact: Low | Effort: Low]*
+
 **Problem:** All exports are treated equally.  Downstream consumers cannot
 tell whether a symbol is the module's public API surface (named) or its
 entry point (default).
@@ -210,9 +358,11 @@ entry point (default).
 
 ---
 
-## 4. Generic Tree-Sitter Analyzer
+## 5. Generic Tree-Sitter Analyzer
 
-### 4.1. Kotlin support
+### 5.1. Kotlin support
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** Kotlin (`.kt`) files are not handled.  Kotlin is a top-10
 language on GitHub.
 
@@ -220,9 +370,11 @@ language on GitHub.
 `tree_sitter_kotlin`.  Map `function_declaration`, `class_declaration`,
 `object_declaration`, `companion_object`, `fun`, `import_list`.
 
-**Files:** `analyzers/generic_ts_analyzer.py`, `language_router.py`
+**Files:** `analyzers/generic_ts_analyzer.py`, `utils/language_router.py`
 
-### 4.2. Swift support
+### 5.2. Swift support
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** Swift (`.swift`) files are not handled.
 
 **Approach:** Add a `LanguageProfile` for Swift using
@@ -230,9 +382,11 @@ language on GitHub.
 `class_declaration`, `struct_declaration`, `protocol_declaration`,
 `extension_declaration`, `import_declaration`.
 
-**Files:** `analyzers/generic_ts_analyzer.py`, `language_router.py`
+**Files:** `analyzers/generic_ts_analyzer.py`, `utils/language_router.py`
 
-### 4.3. PHP support
+### 5.3. PHP support
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** PHP (`.php`) files are not handled.
 
 **Approach:** Add a `LanguageProfile` for PHP using
@@ -240,9 +394,11 @@ language on GitHub.
 `class_declaration`, `interface_declaration`, `trait_declaration`,
 `namespace_definition`, `use_declaration`.
 
-**Files:** `analyzers/generic_ts_analyzer.py`, `language_router.py`
+**Files:** `analyzers/generic_ts_analyzer.py`, `utils/language_router.py`
 
-### 4.4. Nested symbol qualification
+### 5.4. Nested symbol qualification
+*[Impact: Medium | Effort: Medium]*
+
 **Problem:** Functions inside namespaces, impls, or modules are
 generally not qualified with their enclosing scope (except for the
 Java and Rust special cases).  For C++ namespaces, Lua modules, etc.,
@@ -254,7 +410,9 @@ a reusable helper.  Walk parent nodes looking for qualifying scopes
 
 **Files:** `analyzers/generic_ts_analyzer.py`
 
-### 4.5. C/C++ preprocessor macro extraction
+### 5.5. C/C++ preprocessor macro extraction
+*[Impact: Medium | Effort: Medium]*
+
 **Problem:** `#define MACRO(x) …` and `#ifdef` guards are ignored.
 Macros are a critical part of C/C++ APIs.
 
@@ -264,7 +422,9 @@ directives since tree-sitter may not capture them fully.
 
 **Files:** `analyzers/generic_ts_analyzer.py`
 
-### 4.6. Ruby module nesting
+### 5.6. Ruby module nesting
+*[Impact: Low | Effort: Low]*
+
 **Problem:** Ruby classes inside modules (e.g. `module Foo; class Bar; end; end`)
 are captured as flat `"Bar"` without the `Foo::` prefix.
 
@@ -273,7 +433,9 @@ AST traversal.  Prefix each symbol with the full nesting path.
 
 **Files:** `analyzers/generic_ts_analyzer.py`
 
-### 4.7. Lazy grammar loading race condition
+### 5.7. Lazy grammar loading race condition
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** `_loaded_parsers` is a module-level dict with no locking.
 Concurrent calls (e.g. from a multi-threaded indexer) could cause
 double-loading or corruption.
@@ -283,7 +445,9 @@ use `functools.lru_cache` on a parameterless function per language.
 
 **Files:** `analyzers/generic_ts_analyzer.py`
 
-### 4.8. Java inner class qualification
+### 5.8. Java inner class qualification
+*[Impact: Low | Effort: Low]*
+
 **Problem:** Java inner classes are not qualified with their outer class
 (e.g. `Map.Entry`).
 
@@ -292,7 +456,9 @@ declaration's parent is a `class_declaration` body and prefix the name.
 
 **Files:** `analyzers/generic_ts_analyzer.py`
 
-### 4.9. Rust trait bound extraction
+### 5.9. Rust trait bound extraction
+*[Impact: Low | Effort: Low]*
+
 **Problem:** Rust trait bounds on generics (`fn foo<T: Clone + Debug>`) are
 not extracted, losing important type constraint information.
 
@@ -303,9 +469,11 @@ Extract trait bound names and attach to metadata or signature.
 
 ---
 
-## 5. Shell Analyzer
+## 6. Shell Analyzer
 
-### 5.1. Heredoc detection
+### 6.1. Heredoc detection
+*[Impact: Low | Effort: Low]*
+
 **Problem:** Multi-line heredocs (`cat <<EOF … EOF`) are not recognized.
 Functions defined inside heredocs (unusual but possible) would be
 false positives.
@@ -316,16 +484,20 @@ heredoc regions.
 
 **Files:** `analyzers/shell_analyzer.py`
 
-### 5.2. Subshell function detection
+### 6.2. Subshell function detection
+*[Impact: Low | Effort: Low]*
+
 **Problem:** `foo() ( … )` (subshell function syntax) is not matched by the
 existing regex patterns, which expect `{`.
 
 **Approach:** Extend `_FUNC_BARE` to also accept `)` as a closing
-delimiter: `r"^([\w][\w.-]*)\s*\(\s*\)\s*[\({]"`.
+delimiter: `r"^([\w][\w.-]*)\s*\(\s*\)\s*[\(]"`.
 
 **Files:** `analyzers/shell_analyzer.py`
 
-### 5.3. `local` variable tracking
+### 6.3. `local` variable tracking
+*[Impact: Low | Effort: Low]*
+
 **Problem:** `local var=value` inside functions is not captured.  These are
 scoped variables that are important for understanding function behavior.
 
@@ -334,7 +506,9 @@ metadata when inside a function body (tracked by line ranges).
 
 **Files:** `analyzers/shell_analyzer.py`
 
-### 5.4. POSIX compliance
+### 6.4. POSIX compliance
+*[Impact: Low | Effort: Low]*
+
 **Problem:** The parser assumes bash/zsh extensions.  Strict POSIX shells
 (`dash`, `sh`) may use different syntax that is partially missed.
 
@@ -345,9 +519,11 @@ are bash-specific and which are POSIX-compatible.
 
 ---
 
-## 6. Config Analyzer
+## 7. Config Analyzer
 
-### 6.1. Dockerfile instruction extraction
+### 7.1. Dockerfile instruction extraction
+*[Impact: Low | Effort: Medium]*
+
 **Problem:** Dockerfiles are routed to the INI parser, which treats each
 `FROM`, `RUN`, `COPY` line as a generic text entry.  No structured
 understanding of stages, args, or multi-stage builds.
@@ -359,7 +535,9 @@ to structured data: `FROM` → base image, `ARG` → build args,
 
 **Files:** `analyzers/config_analyzer.py`
 
-### 6.2. Makefile target extraction
+### 7.2. Makefile target extraction
+*[Impact: Low | Effort: Medium]*
+
 **Problem:** Makefiles fall through to `_analyze_text_kv`, which misses
 target dependencies, phony targets, and recursive make calls.
 
@@ -370,7 +548,9 @@ in metadata.
 
 **Files:** `analyzers/config_analyzer.py`
 
-### 6.3. YAML anchor and alias resolution
+### 7.3. YAML anchor and alias resolution
+*[Impact: Low | Effort: Medium]*
+
 **Problem:** YAML anchors (`&anchor`) and aliases (`*anchor`) are not
 resolved.  The raw YAML structure is analyzed without expanding
 references, leading to incomplete or misleading data.
@@ -382,7 +562,9 @@ resolved dict back to line numbers where possible.
 
 **Files:** `analyzers/config_analyzer.py`
 
-### 6.4. TOML deep nesting
+### 7.4. TOML deep nesting
+*[Impact: Low | Effort: Low]*
+
 **Problem:** The TOML analyzer only walks one level deep.  Nested tables
 (`[a.b.c]`) beyond the first level are collapsed or lost.
 
@@ -391,7 +573,9 @@ each key with its full dotted path (`a.b.c.key`).
 
 **Files:** `analyzers/config_analyzer.py`
 
-### 6.5. JSON array-of-objects handling
+### 7.5. JSON array-of-objects handling
+*[Impact: Low | Effort: Low]*
+
 **Problem:** When the top-level JSON value is an array of objects, the
 analyzer returns empty results.  Files like `tsconfig.json` with a
 `compilerOptions` nested inside are handled, but `package.json`'s
@@ -403,7 +587,9 @@ the same object analysis, prefixing keys with the array index
 
 **Files:** `analyzers/config_analyzer.py`
 
-### 6.6. XML support
+### 7.6. XML support
+*[Impact: Low | Effort: Medium]*
+
 **Problem:** XML files (`.xml`, `.svg`, `.xsl`, pom.xml, Android manifests)
 have no dedicated analyzer.  They fall through to the generic
 text parser.
@@ -415,17 +601,17 @@ text parser.
 
 ---
 
-## 7. Language Router
+## 8. Language Router
 
-### 7.1. Extension coverage gaps
+### 8.1. Extension coverage gaps
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** Several common extensions are not routed:
-- `.jsx` / `.tsx` → no TypeScript analyzer
 - `.kt` / `.kts` → no Kotlin support
 - `.swift` → no Swift support
 - `.php` → no PHP support
-- `.cs` → no C# support
+- `.cs` → no C# support (despite `tree-sitter-c-sharp` in requirements.txt)
 - `.m` / `.mm` → no Objective-C support
-- `.rs` → routed to generic but requires `tree_sitter_rust` to be installed
 - `.proto` → no Protocol Buffers support
 - `.tf` / `.tfvars` → no Terraform / HCL support
 - `.cypher` → no Cypher support
@@ -434,9 +620,11 @@ text parser.
 languages without tree-sitter grammars, provide a basic regex or
 text-based fallback.
 
-**Files:** `analyzers/language_router.py`
+**Files:** `utils/language_router.py`
 
-### 7.2. Polyglot file detection
+### 8.2. Polyglot file detection
+*[Impact: Medium | Effort: High]*
+
 **Problem:** Files like `.vue` (SFC), `.astro`, `.svelte` contain
 embedded `<script>`, `<style>`, and template sections in different
 languages.  A single language label is insufficient.
@@ -446,34 +634,40 @@ languages.  A single language label is insufficient.
 analyzer on each section.  Merge results, prefixing names with the
 section language.
 
-**Files:** `analyzers/language_router.py`, possibly new `analyzers/polyglot_analyzer.py`
+**Files:** `utils/language_router.py`, possibly new `analyzers/polyglot_analyzer.py`
 
-### 7.3. Shebang-based routing
-**Problem:** Files without extensions (e.g. `Makefile`, `Dockerfile`,
-`Vagrantfile`) or with misleading extensions are routed by name or
-fall through.  Files with `#!/usr/bin/env python3` shebangs are not
-detected.
+### 8.3. Shebang-based routing enhancement
+*[Impact: Low | Effort: Low]*
 
-**Approach:** Read the first line of the file when extension-based routing
-fails.  Map common shebangs (`python`, `bash`, `node`, `ruby`, `perl`,
-`lua`) to the appropriate analyzer.
+**Problem:** While shebang detection exists in `utils/language_router.py`,
+files with misleading extensions or no extension at all that carry
+unusual shebangs (e.g. `#!/usr/bin/env perl`, `#!/usr/bin/lua5.3`) may
+still be missed.
 
-**Files:** `analyzers/language_router.py`
+**Approach:** Expand the shebang mapping in `_detect_from_shebang` to
+cover `perl`, `node` variants, and other interpreters.  Ensure the
+fallback path from extension detection to shebang detection is complete.
 
-### 7.4. Encoding detection
+**Files:** `utils/language_router.py`
+
+### 8.4. Encoding detection
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** Files are assumed to be UTF-8.  Files with Latin-1, Shift-JIS,
 or other encodings may cause `UnicodeDecodeError` or garbled text.
 
 **Approach:** Use `chardet` or `charset-normalizer` to detect encoding
 before opening.  Fall back to UTF-8 with `errors="ignore"` as today.
 
-**Files:** `analyzers/language_router.py` (or a shared utility)
+**Files:** `utils/language_router.py` (or a shared utility)
 
 ---
 
-## 8. Models & Data Layer
+## 9. Models & Data Layer
 
-### 8.1. `FunctionInfo` lacks `params`
+### 9.1. `FunctionInfo` lacks `params` across analyzers
+*[Impact: Medium | Effort: Medium]*
+
 **Problem:** Only the Python analyzer populates `params`.  Go, JavaScript,
 and the generic analyzer leave it empty because tree-sitter does not
 provide a structured parameter list.
@@ -486,7 +680,9 @@ field), JavaScript (formal_parameters), Rust (parameters), Java
 **Files:** `models.py` (ensure field exists), `analyzers/go_analyzer.py`,
 `analyzers/js_analyzer.py`, `analyzers/generic_ts_analyzer.py`
 
-### 8.2. `ClassInfo` lacks `members` / `fields`
+### 9.2. `ClassInfo` lacks `members` / `fields`
+*[Impact: Medium | Effort: Medium]*
+
 **Problem:** Classes are recorded with name and kind but no member list.
 Consumers cannot tell what methods or fields a class has without
 cross-referencing the functions list.
@@ -497,7 +693,9 @@ fields.  For Java, extract field declarations.
 
 **Files:** `models.py`, all analyzers
 
-### 8.3. No visibility/access modifier
+### 9.3. No visibility/access modifier
+*[Impact: Medium | Effort: Medium]*
+
 **Problem:** There is no way to distinguish `public` vs `private` vs
 `protected` symbols.  In Go (unexported = lowercase), Python
 (`_prefix`), Java (`private` keyword), this information is readily
@@ -509,10 +707,12 @@ Infer from naming conventions (Go/Python) or explicit keywords
 
 **Files:** `models.py`, all analyzers
 
-### 8.4. `metadata` dict is unused
-**Problem:** If `FunctionInfo` or `ClassInfo` has a `metadata` field, it is
-not populated by any analyzer.  Language-specific data (decorators,
-annotations, modifiers) has nowhere to go.
+### 9.4. `metadata` dict conventions
+*[Impact: Medium | Effort: Low]*
+
+**Problem:** Language-specific data (decorators, annotations, modifiers)
+has nowhere to go in the current model.  A `metadata` field could hold
+this but no conventions exist.
 
 **Approach:** Define conventions for common metadata keys:
 `{"decorators": [...], "annotations": [...], "modifiers": [...],
@@ -520,63 +720,67 @@ annotations, modifiers) has nowhere to go.
 
 **Files:** `models.py`, all analyzers
 
-### 8.5. No relationship / dependency graph
-**Problem:** The output is a flat list of symbols per file.  Cross-file
-relationships (imports, inheritance, interface implementation) are
-not modeled.
+### 9.5. Import and call graph improvements
+*[Impact: High | Effort: High]*
 
-**Approach:** Add a post-processing pass that builds a dependency graph
-from the collected `FileAnalysis` results.  Link imports to the files
-that define the imported symbols.
+**Problem:** The import graph (`lib/graph.py`) only resolves first-order
+dependencies.  Transitive dependencies (A imports B which imports C)
+are not tracked.  The call graph resolves calls within a single run
+but does not handle indirect call chains.
 
-**Files:** New `indexing/dependency_graph.py`
+**Approach:** Add a transitive closure pass to `build_import_graph` that
+computes full dependency chains (A → B → C).  Store both direct and
+transitive dependencies in the graph.  For the call graph, add a BFS
+pass to compute reachable functions from any starting symbol.
+
+**Files:** `lib/graph.py`
 
 ---
 
-## 9. Indexing Pipeline
+## 10. Indexing Pipeline
 
-### 9.1. Incremental indexing
+### 10.1. Incremental indexing
+*[Impact: High | Effort: Medium]*
+
 **Problem:** The pipeline re-indexes the entire repository on every run.
 For large codebases, this is slow and wasteful.
 
 **Approach:** Store file hashes (e.g. SHA-256) alongside embeddings.  On
 subsequent runs, skip files whose hash hasn't changed.  Remove
-embeddings for deleted files.
+embeddings for deleted files. This is complementary to the semantic
+caching layer (§1.1) which operates at the chunk level.
 
-**Files:** `indexing/full_pipeline.py`, `indexing/embedder.py`
+**Files:** `indexing/full_pipeline.py`, `db.py`
 
-### 9.2. Parallel file processing
-**Problem:** Files are processed sequentially.  On multi-core machines,
-this leaves significant performance on the table.
+### 10.2. Parallel file processing
+*[Impact: High | Effort: Medium]*
+
+**Problem:** Files are processed sequentially in `index_repository`
+(`indexing/full_pipeline.py`).  On multi-core machines, this leaves
+significant performance on the table.
 
 **Approach:** Use `concurrent.futures.ProcessPoolExecutor` or `ThreadPoolExecutor`
 to process files in parallel.  Ensure thread-safe access to the vector
-store.
+store and database connection pool.
 
 **Files:** `indexing/full_pipeline.py`
 
-### 9.3. File size limits
-**Problem:** Very large files (generated code, minified bundles, vendored
-dependencies) can dominate indexing time and storage.
+### 10.3. File size limits already addressed
+*[Impact: N/A | Effort: N/A]*
 
-**Approach:** Skip files exceeding a configurable size limit (e.g. 1 MB).
-Optionally, skip common generated-file directories (`vendor/`,
-`node_modules/`, `dist/`, `build/`, `.git/`).
+**Note:** This has already been implemented in `utils/file_scanner.py`
+with `MAX_FILE_SIZE_BYTES = 512 * 1024` and comprehensive binary
+extension filtering.
 
-**Files:** `indexing/full_pipeline.py`
+### 10.4. Binary file detection already addressed
+*[Impact: N/A | Effort: N/A]*
 
-### 9.4. Binary file detection
-**Problem:** Binary files (images, compiled objects, `.wasm`) are not
-explicitly detected.  Attempting to parse them wastes time and may
-produce garbage.
+**Note:** This has already been implemented in `utils/file_scanner.py`
+via the `BINARY_EXTENSIONS` set and `IGNORE_FILE_SUFFIXES` tuple.
 
-**Approach:** Check for null bytes in the first 8 KB of each file.  If
-found, skip the file.  Also skip by extension (`.png`, `.jpg`, `.so`,
-`.dll`, `.wasm`, etc.).
+### 10.5. Git-aware indexing
+*[Impact: High | Effort: Medium]*
 
-**Files:** `indexing/full_pipeline.py`
-
-### 9.5. Git-aware indexing
 **Problem:** The pipeline does not use git information.  It indexes the
 working tree, which may include uncommitted changes, build artifacts,
 and `.gitignore`-d files.
@@ -585,13 +789,15 @@ and `.gitignore`-d files.
 use `git diff` to detect changes since the last index for true
 incremental updates.
 
-**Files:** `indexing/full_pipeline.py`
+**Files:** `indexing/full_pipeline.py`, `utils/file_scanner.py`
 
 ---
 
-## 10. Search & Retrieval
+## 11. Search & Retrieval
 
-### 10.1. Fuzzy matching
+### 11.1. Fuzzy matching
+*[Impact: Medium | Effort: Medium]*
+
 **Problem:** Search is exact or embedding-based.  Typos and minor naming
 variations (`getUser` vs `get_user` vs `GetUser`) may not match.
 
@@ -599,9 +805,11 @@ variations (`getUser` vs `get_user` vs `GetUser`) may not match.
 that supplements embedding search.  Use it as a fallback when
 embedding similarity is below a threshold.
 
-**Files:** `indexing/embedder.py`, `indexing/search.py` (or equivalent)
+**Files:** `main.py`, `store/pgvector_store.py`
 
-### 10.2. Result ranking
+### 11.2. Hybrid result ranking
+*[Impact: Medium | Effort: High]*
+
 **Problem:** Search results are returned without explicit ranking beyond
 embedding similarity.  Code symbols that match the query directly
 by name should rank higher than code that merely mentions the term.
@@ -610,23 +818,41 @@ by name should rank higher than code that merely mentions the term.
 cosine similarity with text-match boosts (exact name match, file
 path relevance, recency/usage frequency).
 
-**Files:** Search / retrieval layer
+**Files:** `main.py`, `store/pgvector_store.py`, `store/chroma_store.py`
 
-### 10.3. File path filters
+### 11.3. File path and metadata filters
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** Search cannot be scoped to specific directories, file types,
-or glob patterns.
+chunk types, or language filters.
 
 **Approach:** Add optional filter parameters to the search function:
-`path_prefix`, `extension`, `language`.  Apply as pre- or
-post-filters on results.
+`path_prefix`, `extension`, `language`, `chunk_type`.  Apply as
+post-filters on pgvector results or as `WHERE` clause additions.
 
-**Files:** Search / retrieval layer
+**Files:** `main.py`, `store/pgvector_store.py`
+
+### 11.4. Cross-project search
+*[Impact: Medium | Effort: Medium]*
+
+**Problem:** Search is scoped to a single `(namespace, project_id)` pair.
+Users cannot search across all projects in a namespace or across
+namespaces.
+
+**Approach:** Add a `POST /search/text/global` endpoint that accepts an
+optional `namespace` without `project_id`.  When only namespace is
+provided, search across all projects in that namespace.  Aggregate
+and deduplicate results.
+
+**Files:** `main.py`, `store/pgvector_store.py`, `db.py`
 
 ---
 
-## 11. LLM Integration
+## 12. LLM Integration
 
-### 11.1. Context window management
+### 12.1. Context window management
+*[Impact: High | Effort: Medium]*
+
 **Problem:** Large repositories may produce a context that exceeds the LLM's
 context window.  There is no mechanism to truncate or summarize
 selectively.
@@ -636,42 +862,50 @@ repository overview, configuration files, and the most relevant code
 sections (by embedding similarity to the query).  Drop low-relevance
 sections first.
 
-**Files:** `indexing/analyze_any_repo.py` or equivalent
+**Files:** LLM context assembly layer
 
-### 11.2. Multi-provider support
-**Problem:** The system is tightly coupled to Ollama.  Using OpenAI,
-Anthropic, or other providers requires code changes.
+### 12.2. Multi-provider support
+*[Impact: Medium | Effort: Medium]*
+
+**Problem:** The system may be tightly coupled to a single LLM provider.
+Using OpenAI, Anthropic, or other providers requires code changes.
 
 **Approach:** Abstract behind an `LLMProvider` interface with
-implementations for Ollama, OpenAI, Anthropic, and a mock provider for
+implementations for multiple providers and a mock provider for
 testing.  Select via configuration.
 
 **Files:** LLM client layer
 
-### 11.3. Streaming responses
-**Problem:** LLM responses are received in full after the model finishes.
+### 12.3. Streaming responses
+*[Impact: Medium | Effort: Medium]*
+
+**Problem:** LLM responses may be received in full after the model finishes.
 For long analyses, the user sees no output until completion.
 
-**Approach:** Use streaming APIs (`stream=True` in OpenAI, equivalent in
-Ollama) and print tokens as they arrive.
+**Approach:** Use streaming APIs and return tokens as they arrive via
+SSE, similar to the streaming search proposal (§1.5).
 
 **Files:** LLM client layer
 
-### 11.4. Prompt caching
+### 12.4. Prompt caching
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** The same repository context is re-sent on every query.  For
 repositories that don't change between queries, this is wasteful.
 
-**Approach:** Cache the context portion of the prompt.  Only re-send the
-query portion.  Some providers (Anthropic, OpenAI) support explicit
-prompt caching APIs.
+**Approach:** Cache the context portion of the prompt keyed by
+`(namespace, project_id)`.  Only re-send the query portion.  Some
+providers (Anthropic, OpenAI) support explicit prompt caching APIs.
 
 **Files:** LLM client layer
 
 ---
 
-## 12. Testing
+## 13. Testing
 
-### 12.1. No test suite
+### 13.1. No test suite
+*[Impact: Very High | Effort: Medium]*
+
 **Problem:** There are no automated tests.  Refactoring or adding features
 relies entirely on manual verification.
 
@@ -685,7 +919,9 @@ Use `pytest` with `pytest-cov` for coverage reporting.
 
 **Files:** New `tests/` directory
 
-### 12.2. Golden file fixtures
+### 13.2. Golden file fixtures
+*[Impact: High | Effort: Medium]*
+
 **Problem:** Without test fixtures, it is difficult to verify that analyzer
 changes don't regress on real-world code patterns.
 
@@ -695,7 +931,9 @@ source files for each supported language.  Record expected
 
 **Files:** New `tests/fixtures/`, `tests/` test files
 
-### 12.3. Performance benchmarks
+### 13.3. Performance benchmarks
+*[Impact: Medium | Effort: Medium]*
+
 **Problem:** There are no benchmarks.  Performance regressions from new
 features go undetected.
 
@@ -706,37 +944,47 @@ fixture files.  Track over time with CI.
 
 ---
 
-## 13. Operational & DevEx
+## 14. Operational & DevEx
 
-### 13.1. Structured logging
+### 14.1. Structured logging
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** The codebase uses `print()` and `warnings.warn()` for output.
 There is no structured logging with severity levels.
 
 **Approach:** Replace `print` and `warnings` with Python's `logging` module.
 Use JSON-structured logging for machine-parseable output in production.
 
-**Files:** Throughout
+**Files:** Throughout (`indexing/full_pipeline.py`, `lib/embedder.py`,
+`store/chroma_store.py`, `main.py`)
 
-### 13.2. CLI interface
-**Problem:** `analyze_any_repo.py` is a script, not a CLI tool.  There are
-no subcommands, help text, or argument validation.
+### 14.2. CLI interface
+*[Impact: Medium | Effort: Medium]*
+
+**Problem:** The pipeline is invoked programmatically.  There are
+no subcommands, help text, or argument validation for standalone use.
 
 **Approach:** Wrap in `click` or `argparse` with subcommands:
 `index`, `search`, `analyze`, `serve`.  Add `--help`, `--verbose`,
 `--config` flags.
 
-**Files:** New `cli.py` or refactor `analyze_any_repo.py`
+**Files:** New `cli.py`
 
-### 13.3. Configuration file
-**Problem:** Settings (model name, Ollama URL, file size limits, excluded
-paths) are hardcoded or scattered across scripts.
+### 14.3. Configuration file
+*[Impact: Medium | Effort: Medium]*
+
+**Problem:** Settings (model name, file size limits, excluded
+paths) are hardcoded or scattered across modules.
 
 **Approach:** Support a `pyproject.toml` / `.code-index.toml` config file
-with sensible defaults.  Allow CLI flags to override.
+with sensible defaults.  Allow CLI flags and environment variables to
+override.
 
 **Files:** New `config.py`, update all consumers
 
-### 13.4. Progress reporting
+### 14.4. Progress reporting
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** For large repositories, the indexing pipeline provides no
 progress feedback.  The user sees nothing until completion.
 
@@ -745,7 +993,9 @@ showing files processed, total progress, and estimated time remaining.
 
 **Files:** `indexing/full_pipeline.py`
 
-### 13.5. Error reporting
+### 14.5. Error reporting
+*[Impact: Medium | Effort: Low]*
+
 **Problem:** Files that fail to parse are silently skipped.  The user has
 no visibility into which files failed and why.
 
@@ -755,36 +1005,70 @@ with file paths and error messages for failures.
 
 **Files:** `indexing/full_pipeline.py`
 
-### 13.6. Documentation completeness
-**Problem:** The `USAGE_GUIDE.md` focuses on `analyze_any_repo.py`.  There
-is no API documentation, contributor guide, or architecture overview.
+### 14.6. Health check endpoint
+*[Impact: Medium | Effort: Low]*
 
-**Approach:** Add:
-- `ARCHITECTURE.md` — system design and data flow
-- `CONTRIBUTING.md` — how to add a new language analyzer
-- `API.md` — programmatic API reference
-- Inline docstrings with NumPy-style parameter documentation
+**Problem:** The FastAPI service in `main.py` has no health check endpoint.
+Orchestrators (Kubernetes, load balancers) and monitoring systems have
+no way to probe liveness or readiness.
 
-**Files:** Documentation files throughout
+**Approach:** Add a `GET /health` endpoint that checks database
+connectivity and returns `{"status": "ok"}`.  Add a `GET /ready`
+endpoint that also verifies the embedding model is loaded.
+
+**Files:** `main.py`
+
+### 14.7. Request rate limiting
+*[Impact: Medium | Effort: Low]*
+
+**Problem:** The `main.py` API has no rate limiting. A burst of indexing
+requests could overwhelm the database or embedding model.
+
+**Approach:** Add a per-IP or per-API-key rate limiter using a simple
+in-memory sliding window or Redis-backed token bucket.  Apply to
+indexing and embedding endpoints.
+
+**Files:** `main.py`
 
 ---
 
 ## Priority Matrix
 
-| Area | Impact | Effort | Suggested Priority |
-|------|--------|--------|--------------------|
-| Testing (#12) | Very High | Medium | **P0** — foundation for all other work |
-| Incremental indexing (#9.1) | High | Medium | **P0** — performance bottleneck |
-| TypeScript support (#3.1) | High | Medium | **P1** — very common language |
-| Python error-tolerant parsing (#1.6) | High | Low | **P1** — affects many repos |
-| Structured logging (#13.1) | Medium | Low | **P1** — operational hygiene |
-| File size / binary limits (#9.3, #9.4) | Medium | Low | **P1** — easy wins |
-| Polyglot file detection (#7.2) | Medium | High | **P2** — complex but valuable |
-| Kotlin / Swift / PHP (#4.1–4.3) | Medium | Low each | **P2** — add incrementally |
-| Dependency graph (#8.5) | High | High | **P2** — significant new component |
-| Multi-provider LLM (#11.2) | Medium | Medium | **P2** — flexibility |
-| Makefile / Dockerfile analyzers (#6.1, #6.2) | Low | Low | **P3** — niche improvement |
-| Visibility modifiers (#8.3) | Medium | Medium | **P3** — nice to have |
+| # | Area | Impact | Effort | Priority |
+|---|------|--------|--------|----------|
+| 1.1 | Semantic caching layer | High | Medium | **P0** |
+| 1.2 | Per-tenant model routing | High | Low | **P0** |
+| 1.4 | RAG pipeline hooks | High | Medium | **P0** |
+| 13.1 | Test suite foundation | Very High | Medium | **P0** |
+| 10.1 | Incremental indexing | High | Medium | **P0** |
+| 4.1 | TypeScript support | High | Medium | **P1** |
+| 2.6 | Python error-tolerant parsing | High | Medium | **P1** |
+| 14.1 | Structured logging | Medium | Low | **P1** |
+| 10.5 | Git-aware indexing | High | Medium | **P1** |
+| 10.2 | Parallel file processing | High | Medium | **P1** |
+| 12.1 | Context window management | High | Medium | **P1** |
+| 1.5 | Streaming search endpoint | Medium | Medium | **P1** |
+| 1.3 | Embedding cost attribution | Medium | Low | **P1** |
+| 14.6 | Health check endpoint | Medium | Low | **P1** |
+| 14.7 | Request rate limiting | Medium | Low | **P1** |
+| 8.2 | Polyglot file detection | Medium | High | **P2** |
+| 5.1–5.3 | Kotlin / Swift / PHP | Medium | Low each | **P2** |
+| 11.1 | Fuzzy matching | Medium | Medium | **P2** |
+| 11.4 | Cross-project search | Medium | Medium | **P2** |
+| 9.5 | Graph improvements | High | High | **P2** |
+| 12.2 | Multi-provider LLM | Medium | Medium | **P2** |
+| 7.1, 7.2 | Makefile / Dockerfile analyzers | Low | Medium | **P3** |
+| 9.3 | Visibility modifiers | Medium | Medium | **P3** |
+| 6.1–6.4 | Shell analyzer improvements | Low | Low | **P3** |
+| 13.2 | Golden file fixtures | High | Medium | **P1** |
+| 13.3 | Performance benchmarks | Medium | Medium | **P2** |
+| 14.2 | CLI interface | Medium | Medium | **P2** |
+| 14.3 | Configuration file | Medium | Medium | **P2** |
+| 14.4 | Progress reporting | Medium | Low | **P2** |
+| 14.5 | Error reporting | Medium | Low | **P2** |
+| 9.4 | Metadata conventions | Medium | Low | **P2** |
+| 9.1 | Params across analyzers | Medium | Medium | **P2** |
+| 9.2 | ClassInfo members | Medium | Medium | **P2** |
 
 ---
 
