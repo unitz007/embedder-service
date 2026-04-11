@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
@@ -124,10 +124,113 @@ def init_db() -> None:
                 ON embeddings USING ivfflat (embedding vector_cosine_ops)
                 """
             )
+
+            # ── Embedding cache table ──────────────────────────────────
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS embedding_cache (
+                    content_hash BYTEA NOT NULL,
+                    model_name   TEXT    NOT NULL,
+                    embedding    vector  NOT NULL,
+                    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (content_hash, model_name)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS embedding_cache_model_idx
+                ON embedding_cache (model_name)
+                """
+            )
+
             conn.commit()
     finally:
         get_pool().putconn(conn)
 
+
+# ── Embedding cache helpers ────────────────────────────────────────────────
+
+def cache_get_embeddings(
+    hashes_and_models: List[Tuple[bytes, str]],
+) -> Dict[bytes, List[float]]:
+    """Batch-fetch cached embeddings.
+
+    Args:
+        hashes_and_models: List of ``(content_hash, model_name)`` tuples.
+
+    Returns:
+        Dict mapping ``content_hash`` (bytes) → embedding (list of floats).
+        Only hashes that were found in the cache are included.
+    """
+    if not hashes_and_models:
+        return {}
+
+    # Deduplicate input — same (hash, model) pair may appear multiple times
+    unique_keys = list(set(hashes_and_models))
+
+    # Build a composite VALUES clause for a single query.
+    # psycopg2 %s placeholders work with BYTEA and TEXT transparently.
+    rows = ", ".join("(%s, %s)" for _ in unique_keys)
+    sql = f"""
+        SELECT content_hash, embedding
+        FROM embedding_cache
+        WHERE (content_hash, model_name) IN ({rows})
+    """
+    flat_args = []
+    for h, m in unique_keys:
+        flat_args.extend([h, m])
+
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, flat_args)
+            result: Dict[bytes, List[float]] = {}
+            for content_hash, embedding in cur.fetchall():
+                # pgvector returns the vector as a list of floats
+                if isinstance(embedding, str):
+                    # Strip brackets and parse
+                    result[content_hash] = [float(x) for x in embedding.strip("[]").split(",")]
+                else:
+                    result[content_hash] = list(embedding)
+            return result
+    finally:
+        get_pool().putconn(conn)
+
+
+def cache_store_embeddings(
+    rows: List[Tuple[bytes, str, List[float]]],
+) -> None:
+    """Batch-insert embeddings into the cache.
+
+    Args:
+        rows: List of ``(content_hash, model_name, embedding_list)`` tuples.
+              Items whose key already exists are silently ignored (ON CONFLICT DO NOTHING).
+    """
+    if not rows:
+        return
+
+    from psycopg2.extras import execute_values
+
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO embedding_cache (content_hash, model_name, embedding)
+                VALUES %s
+                ON CONFLICT (content_hash, model_name) DO NOTHING
+                """,
+                rows,
+                template="(%s, %s, %s::vector)",
+            )
+            conn.commit()
+    finally:
+        get_pool().putconn(conn)
+
+
+# ── Job helpers ────────────────────────────────────────────────────────────
 
 def _row_to_job(row) -> Dict[str, Any]:
     if not row:
