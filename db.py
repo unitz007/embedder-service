@@ -126,6 +126,11 @@ def init_db() -> None:
             )
 
             # ── Embedding cache table ──────────────────────────────────
+            # The embedding column uses an untyped vector (no dimension)
+            # because the PK is (content_hash, model_name), guaranteeing
+            # that any given row's vector is always consumed with the
+            # correct model.  A fixed dimension would break multi-model
+            # caching (e.g. CodeBERT 768-d vs Voyage 1024-d).
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS embedding_cache (
@@ -353,6 +358,59 @@ def get_job(job_id: str) -> Dict[str, Any]:
             )
             row = cur.fetchone()
             return _row_to_job(row)
+    finally:
+        get_pool().putconn(conn)
+
+
+def update_job_index_meta(
+    namespace: str,
+    project_id: str,
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Update embedder-related metadata on the most recent job for a project.
+
+    This is a best-effort helper: if no job exists for the given
+    ``(namespace, project_id)`` pair the function returns an empty dict
+    without raising.
+    """
+    if not data:
+        return {}
+
+    # Only allow known columns to prevent SQL injection via key names.
+    allowed = {
+        "embedder", "model", "embedding_dim", "use_cloud",
+        "total_vectors", "updated_at",
+    }
+    safe_fields = {k: v for k, v in data.items() if k in allowed}
+    if not safe_fields:
+        return {}
+
+    fields_sql = ", ".join(f"{k} = %s" for k in safe_fields)
+    values = list(safe_fields.values())
+
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE jobs
+                SET {fields_sql}
+                WHERE job_id = (
+                    SELECT job_id FROM jobs
+                    WHERE namespace = %s AND project_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                )
+                RETURNING job_id, namespace, project_id, filename, status,
+                          source, owner, repo, ref, total_vectors,
+                          persist_dir, embedder, webhook_url, error,
+                          created_at, updated_at
+                """,
+                values + [namespace, project_id],
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return _row_to_job(row) if row else {}
     finally:
         get_pool().putconn(conn)
 

@@ -16,6 +16,7 @@ from lib.embedder import (
     embed_repository_chunks,
     CodeEmbedder,
     VoyageEmbedder,
+    EmbeddingCache,
     LARGE_CODEBASE_THRESHOLD,
     EMBEDDING_DIM,
     VOYAGE_EMBEDDING_DIM,
@@ -72,7 +73,6 @@ def chunk_analyses(analyses: List[Any]) -> List[Dict[str, Any]]:
     print(f"Created {len(chunks)} code chunks")
     return chunks
 
-
 def generate_embeddings(
     chunks: List[Dict[str, Any]],
     model_name: str = "microsoft/codebert-base",
@@ -89,7 +89,6 @@ def generate_embeddings(
     if embedder is not None:
         return embedder.embed_chunks(chunks)
     return embed_repository_chunks(chunks, model_name)
-
 
 def search_code(
     vector_store,
@@ -140,6 +139,7 @@ def full_pipeline_chroma(
     graphs_prefix: str = None,
     model_name: str = "microsoft/codebert-base",
     include_dotfiles: bool = False,
+    cache: Optional[EmbeddingCache] = None,
 ) -> tuple:
     """
     Run the complete pipeline and store vectors in Chroma instead of FAISS.
@@ -155,6 +155,8 @@ def full_pipeline_chroma(
                           land next to the Chroma dir.
         model_name:       Embedding model (sentence-transformers).
         include_dotfiles: Include hidden files.
+        cache:            Optional EmbeddingCache for reusing previously
+                          computed embeddings across runs.
 
     Returns:
         Tuple of (ChromaStore, call_graph dict, import_graph dict)
@@ -163,6 +165,10 @@ def full_pipeline_chroma(
 
     if graphs_prefix is None:
         graphs_prefix = str(Path(chroma_dir).parent / "vector_store")
+
+    # Create a cache if none was supplied — enables semantic reuse by default
+    if cache is None:
+        cache = EmbeddingCache()
 
     print(f"Starting Chroma pipeline for repository: {repo_path}")
     print("=" * 50)
@@ -189,12 +195,12 @@ def full_pipeline_chroma(
             f"Step 7: {len(chunks)} chunks exceeds threshold "
             f"({LARGE_CODEBASE_THRESHOLD}). Using Voyage AI cloud embedder..."
         )
-        embedder = VoyageEmbedder()
+        embedder = VoyageEmbedder(cache=cache)
     else:
         print(
             f"Step 7: {len(chunks)} chunks. Using local CodeBERT embedder..."
         )
-        embedder = CodeEmbedder(model_name)
+        embedder = CodeEmbedder(model_name, cache=cache)
 
     chunks_with_embeddings = generate_embeddings(chunks, embedder=embedder)
 
@@ -254,6 +260,7 @@ def full_pipeline_pgvector(
     project_id: str,
     model_name: str = "microsoft/codebert-base",
     include_dotfiles: bool = False,
+    cache: Optional[EmbeddingCache] = None,
 ) -> tuple:
     """
     Run the complete pipeline and store vectors in Postgres/pgvector.
@@ -264,12 +271,18 @@ def full_pipeline_pgvector(
         project_id:       Project identifier.
         model_name:       Embedding model (sentence-transformers).
         include_dotfiles: Include hidden files.
+        cache:            Optional EmbeddingCache for reusing previously
+                          computed embeddings across runs.
 
     Returns:
         Tuple of (PgVectorStore, call_graph dict, import_graph dict, index_meta dict)
     """
     print(f"Starting pgvector pipeline for repository: {repo_path}")
     print("=" * 50)
+
+    # Create a cache if none was supplied — enables semantic reuse by default
+    if cache is None:
+        cache = EmbeddingCache()
 
     # Steps 1-5: Symbol extraction
     analyses = index_repository(repo_path, include_dotfiles=include_dotfiles)
@@ -293,12 +306,12 @@ def full_pipeline_pgvector(
             f"Step 7: {len(chunks)} chunks exceeds threshold "
             f"({LARGE_CODEBASE_THRESHOLD}). Using Voyage AI cloud embedder..."
         )
-        embedder = VoyageEmbedder()
+        embedder = VoyageEmbedder(cache=cache)
     else:
         print(
             f"Step 7: {len(chunks)} chunks. Using local CodeBERT embedder..."
         )
-        embedder = CodeEmbedder(model_name)
+        embedder = CodeEmbedder(model_name, cache=cache)
 
     chunks_with_embeddings = generate_embeddings(chunks, embedder=embedder)
 

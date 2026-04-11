@@ -31,6 +31,8 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 from sentence_transformers import SentenceTransformer
 
+import db as _db
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -99,8 +101,6 @@ class EmbeddingCache:
     """
 
     def __init__(self) -> None:
-        # Lazy import to avoid circular imports at module level
-        import db as _db
         self._db = _db
 
     @staticmethod
