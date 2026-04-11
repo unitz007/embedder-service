@@ -16,7 +16,7 @@ import requests
 
 from indexing.full_pipeline import full_pipeline_pgvector
 from store.pgvector_store import PgVectorStore
-from lib.embedder import CodeEmbedder, VoyageEmbedder, DEFAULT_MODEL
+from lib.embedder import CodeEmbedder, VoyageEmbedder, EmbeddingCache, DEFAULT_MODEL
 import db
 
 app = FastAPI()
@@ -28,8 +28,13 @@ VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
 
 # Jobs are persisted in Postgres (local for dev, Supabase for prod)
 
+# Shared semantic embedding cache — reused across all embedder instances
+# (index-time and query-time).  Identical content with the same model always
+# produces the same embedding, so a single cache instance is safe.
+EMBEDDING_CACHE = EmbeddingCache()
+
 # Reuse a single local embedder instance to avoid reload per request
-EMBEDDER = CodeEmbedder(DEFAULT_MODEL)
+EMBEDDER = CodeEmbedder(DEFAULT_MODEL, cache=EMBEDDING_CACHE)
 
 
 @app.on_event("startup")
@@ -336,7 +341,7 @@ def search_embeddings(req: SearchRequest):
         if index_meta.get("use_cloud"):
             if not VOYAGE_API_KEY:
                 return {"error": "VOYAGE_API_KEY is not set on this server"}
-            embedding = VoyageEmbedder(api_key=VOYAGE_API_KEY, input_type="query").encode([req.text])[0].tolist()
+            embedding = VoyageEmbedder(api_key=VOYAGE_API_KEY, input_type="query", cache=EMBEDDING_CACHE).encode([req.text])[0].tolist()
         else:
             embedding = EMBEDDER.encode([req.text])[0].tolist()
 
@@ -369,7 +374,7 @@ def search_by_text(req: TextSearchRequest):
     if index_meta.get("use_cloud"):
         if not VOYAGE_API_KEY:
             return {"error": "VOYAGE_API_KEY is not set on this server"}
-        embedding = VoyageEmbedder(api_key=VOYAGE_API_KEY, input_type="query").encode([req.query])[0].tolist()
+        embedding = VoyageEmbedder(api_key=VOYAGE_API_KEY, input_type="query", cache=EMBEDDING_CACHE).encode([req.query])[0].tolist()
     else:
         embedding = EMBEDDER.encode([req.query])[0].tolist()
 
@@ -406,8 +411,8 @@ def embed_text(req: EmbedRequest):
     if use_cloud:
         if not VOYAGE_API_KEY:
             return {"error": "VOYAGE_API_KEY is not set on this server"}
-        embedder = VoyageEmbedder(api_key=VOYAGE_API_KEY, input_type="query")
-        embedding = embedder.encode([req.text])[0].tolist()
+        cloud_embedder = VoyageEmbedder(api_key=VOYAGE_API_KEY, input_type="query", cache=EMBEDDING_CACHE)
+        embedding = cloud_embedder.encode([req.text])[0].tolist()
         return {"embedding": embedding, "model": "voyage-code-3"}
 
     embedding = EMBEDDER.encode([req.text])[0].tolist()

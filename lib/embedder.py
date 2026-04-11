@@ -12,6 +12,7 @@ Cloud model (Voyage AI voyage-code-3):
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import logging
 
@@ -22,13 +23,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 import logging
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional, Tuple
 
 import numpy as np
 import requests
 import torch
 from transformers import AutoTokenizer, AutoModel
 from sentence_transformers import SentenceTransformer
+
+import db as _db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -82,14 +85,107 @@ def _mean_pool(last_hidden_state: "torch.Tensor", attention_mask: "torch.Tensor"
 
 
 # -------------------------------------------------------------------
+# Embedding cache
+# -------------------------------------------------------------------
+
+class EmbeddingCache:
+    """Transparent content-hash → embedding cache backed by Postgres.
+
+    Computes SHA-256 of each chunk's content and looks up previously
+    computed embeddings before calling the model.  On cache miss the
+    freshly computed embedding is stored for future reuse.
+
+    The cache key is ``(sha256(content), model_name)`` and is **cross-project**:
+    identical content embedded by the same model produces the same
+    embedding regardless of which project it belongs to.
+    """
+
+    def __init__(self) -> None:
+        self._db = _db
+
+    @staticmethod
+    def hash_text(text: str) -> bytes:
+        """Return the SHA-256 digest of *text* as raw bytes (32 bytes)."""
+        return hashlib.sha256(text.encode("utf-8")).digest()
+
+    def get(
+        self,
+        texts: List[str],
+        model_name: str,
+    ) -> Tuple[Dict[int, List[float]], List[int]]:
+        """Look up cached embeddings for *texts*.
+
+        Args:
+            texts:      Input text strings.
+            model_name: Embedding model identifier (used as cache key suffix).
+
+        Returns:
+            ``(hits, miss_indices)``
+            *hits* maps original index → embedding list for cache hits.
+            *miss_indices* is the list of indices that were **not** in the cache.
+        """
+        keys: List[Tuple[bytes, str]] = []
+        index_by_hash: Dict[bytes, int] = {}
+        for i, text in enumerate(texts):
+            h = self.hash_text(text)
+            keys.append((h, model_name))
+            index_by_hash[h] = i
+
+        cached = self._db.cache_get_embeddings(keys)
+
+        hits: Dict[int, List[float]] = {}
+        miss_indices: List[int] = []
+        for i, text in enumerate(texts):
+            h = self.hash_text(text)
+            if h in cached:
+                hits[i] = cached[h]
+            else:
+                miss_indices.append(i)
+
+        hit_count = len(hits)
+        total = len(texts)
+        logger.debug(
+            "Embedding cache: %d/%d hits for model %s",
+            hit_count, total, model_name,
+        )
+
+        return hits, miss_indices
+
+    def store(
+        self,
+        hashes: List[bytes],
+        model_name: str,
+        embeddings: np.ndarray,
+    ) -> None:
+        """Store newly computed embeddings in the cache.
+
+        Args:
+            hashes:     SHA-256 digests for each embedding row.
+            model_name: Embedding model identifier.
+            embeddings: numpy array of shape ``(len(hashes), dim)``.
+        """
+        rows = [
+            (h, model_name, emb.tolist())
+            for h, emb in zip(hashes, embeddings)
+        ]
+        if rows:
+            self._db.cache_store_embeddings(rows)
+            logger.debug(
+                "Embedding cache: stored %d entries for model %s",
+                len(rows), model_name,
+            )
+
+
+# -------------------------------------------------------------------
 # Embedder
 # -------------------------------------------------------------------
 
 class CodeEmbedder:
 
-    def __init__(self, model_name: str = DEFAULT_MODEL):
+    def __init__(self, model_name: str = DEFAULT_MODEL, cache: Optional[EmbeddingCache] = None):
 
         self.model_name = model_name
+        self._cache = cache
 
         self._tokenizer = None
         self._model = None
@@ -262,6 +358,41 @@ class CodeEmbedder:
         if not texts:
             return np.empty((0, self._dim), dtype=np.float32)
 
+        # ── Cache path ─────────────────────────────────────────────
+        if self._cache is not None:
+            hits, miss_indices = self._cache.get(texts, self.model_name)
+
+            if not miss_indices:
+                # Full cache hit — assemble result preserving original order
+                result = np.empty((len(texts), self._dim), dtype=np.float32)
+                for idx, emb_list in hits.items():
+                    result[idx] = np.array(emb_list, dtype=np.float32)
+                return result
+
+            # Compute embeddings only for misses
+            miss_texts = [texts[i] for i in miss_indices]
+            miss_embeddings = self._encode_uncached(miss_texts)
+
+            # Store new embeddings in cache
+            miss_hashes = [self._cache.hash_text(texts[i]) for i in miss_indices]
+            self._cache.store(miss_hashes, self.model_name, miss_embeddings)
+
+            # Assemble full result
+            result = np.empty((len(texts), self._dim), dtype=np.float32)
+            for idx, emb_list in hits.items():
+                result[idx] = np.array(emb_list, dtype=np.float32)
+            for local_i, global_i in enumerate(miss_indices):
+                result[global_i] = miss_embeddings[local_i]
+            return result
+
+        # ── No cache — original behaviour ──────────────────────────
+        return self._encode_uncached(texts)
+
+    def _encode_uncached(self, texts: List[str]) -> np.ndarray:
+        """Encode *texts* without consulting the cache."""
+        if not texts:
+            return np.empty((0, self._dim), dtype=np.float32)
+
         if self._model is not None and self._tokenizer is not None:
 
             try:
@@ -333,7 +464,7 @@ class VoyageEmbedder:
     Suitable for large codebases where local inference is too slow.
     """
 
-    def __init__(self, api_key: str | None = None, input_type: str = "document"):
+    def __init__(self, api_key: str | None = None, input_type: str = "document", cache: Optional[EmbeddingCache] = None):
         self.api_key = api_key or os.environ.get("VOYAGE_API_KEY", "")
         if not self.api_key:
             raise RuntimeError(
@@ -342,12 +473,48 @@ class VoyageEmbedder:
             )
         self.input_type = input_type
         self._dim = VOYAGE_EMBEDDING_DIM
+        self._cache = cache
 
     @property
     def dim(self) -> int:
         return self._dim
 
     def encode(self, texts: List[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self._dim), dtype=np.float32)
+
+        # ── Cache path ─────────────────────────────────────────────
+        if self._cache is not None:
+            hits, miss_indices = self._cache.get(texts, VOYAGE_MODEL)
+
+            if not miss_indices:
+                # Full cache hit
+                result = np.empty((len(texts), self._dim), dtype=np.float32)
+                for idx, emb_list in hits.items():
+                    result[idx] = np.array(emb_list, dtype=np.float32)
+                return result
+
+            # Call Voyage API only for misses
+            miss_texts = [texts[i] for i in miss_indices]
+            miss_embeddings = self._encode_via_api(miss_texts)
+
+            # Store new embeddings in cache
+            miss_hashes = [self._cache.hash_text(texts[i]) for i in miss_indices]
+            self._cache.store(miss_hashes, VOYAGE_MODEL, miss_embeddings)
+
+            # Assemble full result
+            result = np.empty((len(texts), self._dim), dtype=np.float32)
+            for idx, emb_list in hits.items():
+                result[idx] = np.array(emb_list, dtype=np.float32)
+            for local_i, global_i in enumerate(miss_indices):
+                result[global_i] = miss_embeddings[local_i]
+            return result
+
+        # ── No cache — original behaviour ──────────────────────────
+        return self._encode_via_api(texts)
+
+    def _encode_via_api(self, texts: List[str]) -> np.ndarray:
+        """Encode *texts* via the Voyage AI API (no cache lookup)."""
         if not texts:
             return np.empty((0, self._dim), dtype=np.float32)
 
