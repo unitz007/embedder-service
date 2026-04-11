@@ -24,7 +24,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
-from models import FileAnalysis, FunctionInfo, ClassInfo
+from models import FileAnalysis, FunctionInfo, ClassInfo, VariableInfo
 
 
 # ---------------------------------------------------------------------------
@@ -43,17 +43,24 @@ class LanguageProfile:
     class_types: List[str]
     # Tree-sitter node types that represent import/use/require statements
     import_types: List[str]
-    # How to get the name from a func/class node.
+    # Tree-sitter node types that represent variable/constant declarations
+    var_types: List[str] = field(default_factory=list)
+    # How to get the name from a func/class/node.
     # "field:<name>"       → node.child_by_field_name("<name>")
     # "first_identifier"   → first child with type "identifier"
     # "text"               → entire node text (for import statements)
     func_name_strategy: str = "field:name"
     class_name_strategy: str = "field:name"
     import_text_strategy: str = "text"
+    var_name_strategy: str = "field:name"
     # Map node.type → human-readable kind label shown in metadata
     kind_map: Dict[str, str] = field(default_factory=dict)
+    # Map var node.type → kind label for VariableInfo (e.g. "const", "static")
+    var_kind_map: Dict[str, str] = field(default_factory=dict)
     # Node types considered doc comments (looked for immediately before decls)
     doc_types: List[str] = field(default_factory=list)
+    # Field name on var node that holds the value (if any)
+    var_value_field: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -67,14 +74,21 @@ LANGUAGE_PROFILES: Dict[str, LanguageProfile] = {
         func_types=["function_item"],
         class_types=["struct_item", "enum_item", "trait_item", "impl_item"],
         import_types=["use_declaration"],
+        var_types=["const_item", "static_item"],
         func_name_strategy="field:name",
         class_name_strategy="field:name",
         import_text_strategy="text",
+        var_name_strategy="field:name",
+        var_value_field="value",
         kind_map={
             "struct_item": "struct",
             "enum_item": "enum",
             "trait_item": "trait",
             "impl_item": "impl",
+        },
+        var_kind_map={
+            "const_item": "const",
+            "static_item": "static",
         },
         doc_types=["line_comment", "block_comment"],
     ),
@@ -84,13 +98,19 @@ LANGUAGE_PROFILES: Dict[str, LanguageProfile] = {
         func_types=["method_declaration", "constructor_declaration"],
         class_types=["class_declaration", "interface_declaration", "enum_declaration"],
         import_types=["import_declaration"],
+        var_types=["field_declaration"],
         func_name_strategy="field:name",
         class_name_strategy="field:name",
         import_text_strategy="text",
+        var_name_strategy="field:name",
+        var_value_field="value",
         kind_map={
             "class_declaration": "class",
             "interface_declaration": "interface",
             "enum_declaration": "enum",
+        },
+        var_kind_map={
+            "field_declaration": "field",
         },
         doc_types=["block_comment"],
     ),
@@ -115,13 +135,19 @@ LANGUAGE_PROFILES: Dict[str, LanguageProfile] = {
         func_types=["function_definition"],
         class_types=["struct_specifier", "enum_specifier", "union_specifier"],
         import_types=["preproc_include"],
+        var_types=["declaration"],
         func_name_strategy="nested:declarator/function_declarator/declarator",
         class_name_strategy="field:name",
         import_text_strategy="text",
+        var_name_strategy="first_identifier",
+        var_value_field="value",
         kind_map={
             "struct_specifier": "struct",
             "enum_specifier": "enum",
             "union_specifier": "union",
+        },
+        var_kind_map={
+            "declaration": "var",
         },
         doc_types=["comment"],
     ),
@@ -134,14 +160,20 @@ LANGUAGE_PROFILES: Dict[str, LanguageProfile] = {
             "enum_specifier", "namespace_definition",
         ],
         import_types=["preproc_include"],
+        var_types=["declaration"],
         func_name_strategy="nested:declarator/function_declarator/declarator",
         class_name_strategy="field:name",
         import_text_strategy="text",
+        var_name_strategy="first_identifier",
+        var_value_field="value",
         kind_map={
             "class_specifier": "class",
             "struct_specifier": "struct",
             "enum_specifier": "enum",
             "namespace_definition": "namespace",
+        },
+        var_kind_map={
+            "declaration": "var",
         },
         doc_types=["comment"],
     ),
@@ -313,6 +345,28 @@ def _is_lua_require(node) -> bool:
     return False
 
 
+def _is_var_node_interesting(node, profile: LanguageProfile) -> bool:
+    """
+    Filter out variable/const nodes that aren't useful to index.
+    For C/C++ declarations, skip function declarations and pointer-to-function
+    declarations that have a "type:function_declarator" child (already captured
+    as functions).
+    """
+    if profile.language_name in ("c", "cpp"):
+        # Skip declarations that are function definitions (already captured)
+        for child in node.children:
+            if child.type == "function_declarator":
+                return False
+        # Skip declarations without an initializer (just forward declarations)
+        if node.child_by_field_name("value") is None:
+            return False
+        # Skip pointer-to-function declarations
+        type_node = node.child_by_field_name("type")
+        if type_node and b"(" in type_node.text:
+            return False
+    return True
+
+
 import re  # noqa: E402 (needed for _get_leading_doc)
 
 
@@ -351,6 +405,7 @@ def analyze_generic(file_path: str, language: str) -> Optional[FileAnalysis]:
     functions: List[FunctionInfo] = []
     classes: List[ClassInfo] = []
     imports: List[str] = []
+    variables: List[VariableInfo] = []
 
     # --- Functions ---
     for node in _find_all(root, profile.func_types):
@@ -419,6 +474,46 @@ def analyze_generic(file_path: str, language: str) -> Optional[FileAnalysis]:
             )
         )
 
+    # --- Variables / constants ---
+    if profile.var_types:
+        for node in _find_all(root, profile.var_types):
+            if not _is_var_node_interesting(node, profile):
+                continue
+
+            name = _resolve_name(node, profile.var_name_strategy, code)
+            if not name:
+                continue
+
+            # Extract value text if a value field is configured
+            value = ""
+            if profile.var_value_field:
+                val_node = node.child_by_field_name(profile.var_value_field)
+                if val_node:
+                    raw = val_node.text.decode("utf-8", errors="ignore").strip()
+                    value = raw[:120] if len(raw) > 120 else raw
+
+            # For Java fields, qualify with the class name if inside a class body
+            if profile.language_name == "java" and node.parent:
+                parent_name = _resolve_name(
+                    node.parent, profile.class_name_strategy, code
+                )
+                if parent_name:
+                    name = f"{parent_name}.{name}"
+
+            start_line = node.start_point[0]
+            kind = profile.var_kind_map.get(node.type, "var")
+            doc = _get_leading_doc(node, code, profile.doc_types)
+
+            variables.append(
+                VariableInfo(
+                    name=name,
+                    line=start_line,
+                    kind=kind,
+                    value=value,
+                    docstring=doc,
+                )
+            )
+
     # --- Imports ---
     for node in _find_all(root, profile.import_types):
         # Ruby: only require/require_relative calls
@@ -440,4 +535,5 @@ def analyze_generic(file_path: str, language: str) -> Optional[FileAnalysis]:
         functions=functions,
         classes=classes,
         imports=imports,
+        variables=variables,
     )

@@ -2,8 +2,8 @@
 
 import tree_sitter_go
 from tree_sitter import Language, Parser
-from typing import List, Optional
-from models import FileAnalysis, FunctionInfo, ClassInfo, FieldInfo
+from typing import List
+from models import FileAnalysis, FunctionInfo, ClassInfo, VariableInfo, FieldInfo
 
 GO_LANGUAGE_PTR = tree_sitter_go.language()
 GO_LANGUAGE = Language(GO_LANGUAGE_PTR)
@@ -55,45 +55,95 @@ def _get_package(root) -> str:
     return ""
 
 
-def _extract_struct_fields(struct_type_node, code: bytes) -> List[FieldInfo]:
+def _extract_struct_fields(type_node) -> List[FieldInfo]:
     """
-    Extract field info from a struct_type node's field_definition children.
+    Extract fields from a Go struct_type node.
 
-    In tree-sitter-go, each field_definition node has:
-      - A "field_identifier" child for named fields
-      - A "tag" child (optional) for struct tags like `json:"name,omitempty"`
-      - A type child (direct child, not nested) for the field type
-
-    Embedded fields (e.g. `http.Handler`) have no field_identifier child.
-    Blank identifier fields (e.g. `_ int`) have field_identifier text "_".
+    Each field_definition node may have:
+      - A "name" field (field name)
+      - A "type" field (type identifier)
+      - A "tag" field (struct tag like `json:"id" db:"id"`)
     """
     fields: List[FieldInfo] = []
 
-    for child in struct_type_node.children:
-        if child.type != "field_definition":
+    if type_node is None or type_node.type != "struct_type":
+        return fields
+
+    field_defs = _find_nodes_of_type(type_node, "field_definition")
+    for fd in field_defs:
+        name_node = fd.child_by_field_name("name")
+        type_node_field = fd.child_by_field_name("type")
+        tag_node = fd.child_by_field_name("tag")
+
+        if name_node is None:
             continue
 
-        field_name = ""
-        type_str = ""
-        tag_str = ""
+        name = name_node.text.decode("utf-8", errors="ignore")
+        type_str = type_node_field.text.decode("utf-8", errors="ignore") if type_node_field else ""
+        tag = tag_node.text.decode("utf-8", errors="ignore") if tag_node else ""
 
-        # Look at direct children to extract name, type, and tag
-        for fd_child in child.children:
-            if fd_child.type == "field_identifier":
-                field_name = fd_child.text.decode("utf-8", errors="ignore")
-            elif fd_child.type == "tag":
-                tag_str = fd_child.text.decode("utf-8", errors="ignore")
-            # The type is any direct child that is not field_identifier, tag, or comment
-            elif fd_child.type not in ("comment", "field_identifier", "tag"):
-                type_str = fd_child.text.decode("utf-8", errors="ignore")
-
-        fields.append(FieldInfo(
-            name=field_name,
-            type_str=type_str,
-            tag=tag_str,
-        ))
+        fields.append(FieldInfo(name=name, type_str=type_str, tag=tag))
 
     return fields
+
+
+def _extract_variables(root, source_lines: List[str], code: bytes) -> List[VariableInfo]:
+    """
+    Extract const and var declarations from top-level nodes.
+
+    Handles both single declarations (const foo = 1) and parenthesised blocks:
+        const (
+            APIVersion = "v2"
+            DefaultTimeout = 30 * time.Second
+        )
+    """
+    variables: List[VariableInfo] = []
+
+    for child in root.children:
+        if child.type not in ("const_declaration", "var_declaration"):
+            continue
+
+        kind = "const" if child.type == "const_declaration" else "var"
+        doc = _get_leading_comments(source_lines, child.start_point[0])
+
+        # Check for parenthesised block: const ( ... ) or var ( ... )
+        # The first child may be a "const_spec" or a "(" block containing multiple specs
+        specs = _find_nodes_of_type(child, "const_spec") + _find_nodes_of_type(child, "var_spec")
+
+        for spec in specs:
+            # name is the first child, value is field "value"
+            name_node = spec.child_by_field_name("name")
+            value_node = spec.child_by_field_name("value")
+            type_node = spec.child_by_field_name("type")
+
+            if name_node:
+                name = name_node.text.decode("utf-8", errors="ignore")
+                value = ""
+                if value_node:
+                    raw_value = value_node.text.decode("utf-8", errors="ignore").strip()
+                    value = raw_value[:200]
+                type_annotation = ""
+                if type_node:
+                    type_annotation = type_node.text.decode("utf-8", errors="ignore").strip()
+                start_line = spec.start_point[0]
+
+                # For parenthesised blocks, each spec can have its own comment
+                spec_doc = doc
+                # Check if this individual spec has its own leading comment
+                own_doc = _get_leading_comments(source_lines, start_line)
+                if own_doc and own_doc != doc:
+                    spec_doc = own_doc
+
+                variables.append(VariableInfo(
+                    name=name,
+                    line=start_line,
+                    kind=kind,
+                    value=value,
+                    type_annotation=type_annotation,
+                    docstring=spec_doc,
+                ))
+
+    return variables
 
 
 def analyze_go(file_path):
@@ -158,19 +208,12 @@ def analyze_go(file_path):
                 name_node = spec.child_by_field_name("name")
                 type_node = spec.child_by_field_name("type")
                 if name_node:
-                    # Extract generic type parameters if present
-                    type_params = ""
-                    for c in spec.children:
-                        if c.type == "type_parameter_list":
-                            type_params = c.text.decode("utf-8", errors="ignore")
-                            break
-
                     kind = "type_alias"
                     struct_fields: List[FieldInfo] = []
                     if type_node:
                         if type_node.type == "struct_type":
                             kind = "struct"
-                            struct_fields = _extract_struct_fields(type_node, code)
+                            struct_fields = _extract_struct_fields(type_node)
                         elif type_node.type == "interface_type":
                             kind = "interface"
                     start = spec.start_point[0]
@@ -179,7 +222,6 @@ def analyze_go(file_path):
                         line=start,
                         docstring=_get_leading_comments(source_lines, start),
                         kind=kind,
-                        type_params=type_params,
                         fields=struct_fields,
                     ))
 
@@ -190,6 +232,9 @@ def analyze_go(file_path):
                 if path_node:
                     imports.append(path_node.text.decode().strip('"'))
 
+    # Extract variables
+    variables = _extract_variables(root, source_lines, code)
+
     return FileAnalysis(
         file_path=file_path,
         language="go",
@@ -197,4 +242,5 @@ def analyze_go(file_path):
         classes=classes,
         imports=imports,
         package=package,
+        variables=variables,
     )
