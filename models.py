@@ -20,6 +20,7 @@ class ClassInfo:
     line: int
     docstring: str = ""
     kind: str = ""              # "class", "struct", "interface", "type_alias", "enum"
+    type_params: str = ""       # Generic type parameters e.g. "[T comparable, V any]"
 
 
 @dataclass
