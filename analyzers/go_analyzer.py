@@ -117,6 +117,13 @@ def analyze_go(file_path):
                 name_node = spec.child_by_field_name("name")
                 type_node = spec.child_by_field_name("type")
                 if name_node:
+                    # Extract generic type parameters if present
+                    type_params = ""
+                    for c in spec.children:
+                        if c.type == "type_parameter_list":
+                            type_params = c.text.decode("utf-8", errors="ignore")
+                            break
+
                     kind = "type_alias"
                     if type_node:
                         if type_node.type == "struct_type":
@@ -129,6 +136,7 @@ def analyze_go(file_path):
                         line=start,
                         docstring=_get_leading_comments(source_lines, start),
                         kind=kind,
+                        type_params=type_params,
                     ))
 
         # Import declarations
