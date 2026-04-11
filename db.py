@@ -72,7 +72,14 @@ def init_db() -> None:
                 )
                 """
             )
+            # Add columns that may not exist on older databases.
+            # embedder is already in CREATE TABLE above but the ALTER is
+            # harmless for fresh installs and needed for existing DBs where
+            # the column was added via ALTER originally.
             cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS embedder TEXT")
+            cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS model TEXT")
+            cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS embedding_dim INTEGER")
+            cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS use_cloud BOOLEAN DEFAULT FALSE")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS index_meta (
@@ -237,33 +244,45 @@ def cache_store_embeddings(
 
 # ── Job helpers ────────────────────────────────────────────────────────────
 
+# Canonical list of columns for the jobs table.  Used by _row_to_job() and
+# the RETURNING clauses so that every query returns the same shape.
+_JOB_COLUMNS = [
+    "job_id",
+    "namespace",
+    "project_id",
+    "filename",
+    "status",
+    "source",
+    "owner",
+    "repo",
+    "ref",
+    "total_vectors",
+    "persist_dir",
+    "embedder",
+    "model",
+    "embedding_dim",
+    "use_cloud",
+    "webhook_url",
+    "error",
+    "created_at",
+    "updated_at",
+]
+
+
 def _row_to_job(row) -> Dict[str, Any]:
     if not row:
         return {}
-    keys = [
-        "job_id",
-        "namespace",
-        "project_id",
-        "filename",
-        "status",
-        "source",
-        "owner",
-        "repo",
-        "ref",
-        "total_vectors",
-        "persist_dir",
-        "embedder",
-        "webhook_url",
-        "error",
-        "created_at",
-        "updated_at",
-    ]
-    job = dict(zip(keys, row))
+    job = dict(zip(_JOB_COLUMNS, row))
     if isinstance(job.get("created_at"), datetime):
         job["created_at"] = job["created_at"].isoformat() + "Z"
     if isinstance(job.get("updated_at"), datetime):
         job["updated_at"] = job["updated_at"].isoformat() + "Z"
     return job
+
+
+def _JOB_RETURNING_CLAUSE() -> str:
+    """SQL fragment listing all job columns for RETURNING clauses."""
+    return ", ".join(_JOB_COLUMNS)
 
 
 def create_job(
@@ -280,20 +299,18 @@ def create_job(
     repo: Optional[str] = None,
     ref: Optional[str] = None,
 ) -> Dict[str, Any]:
+    returning = _JOB_RETURNING_CLAUSE()
     conn = get_pool().getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 INSERT INTO jobs (
                     job_id, namespace, project_id, filename, status,
                     source, owner, repo, ref, webhook_url,
                     created_at, updated_at
                 ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                RETURNING job_id, namespace, project_id, filename, status,
-                          source, owner, repo, ref, total_vectors,
-                          persist_dir, embedder, webhook_url, error,
-                          created_at, updated_at
+                RETURNING {returning}
                 """,
                 (
                     job_id, namespace, project_id, filename, status,
@@ -319,6 +336,7 @@ def update_job(job_id: str, **updates) -> Dict[str, Any]:
         values.append(v)
     values.append(job_id)
 
+    returning = _JOB_RETURNING_CLAUSE()
     conn = get_pool().getconn()
     try:
         with conn.cursor() as cur:
@@ -327,10 +345,7 @@ def update_job(job_id: str, **updates) -> Dict[str, Any]:
                 UPDATE jobs
                 SET {", ".join(fields)}
                 WHERE job_id = %s
-                RETURNING job_id, namespace, project_id, filename, status,
-                          source, owner, repo, ref, total_vectors,
-                          persist_dir, embedder, webhook_url, error,
-                          created_at, updated_at
+                RETURNING {returning}
                 """,
                 values,
             )
@@ -342,15 +357,13 @@ def update_job(job_id: str, **updates) -> Dict[str, Any]:
 
 
 def get_job(job_id: str) -> Dict[str, Any]:
+    returning = _JOB_RETURNING_CLAUSE()
     conn = get_pool().getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT job_id, namespace, project_id, filename, status,
-                       source, owner, repo, ref, total_vectors,
-                       persist_dir, embedder, webhook_url, error,
-                       created_at, updated_at
+                f"""
+                SELECT {returning}
                 FROM jobs
                 WHERE job_id = %s
                 """,
@@ -388,6 +401,7 @@ def update_job_index_meta(
     fields_sql = ", ".join(f"{k} = %s" for k in safe_fields)
     values = list(safe_fields.values())
 
+    returning = _JOB_RETURNING_CLAUSE()
     conn = get_pool().getconn()
     try:
         with conn.cursor() as cur:
@@ -401,10 +415,7 @@ def update_job_index_meta(
                     ORDER BY created_at DESC
                     LIMIT 1
                 )
-                RETURNING job_id, namespace, project_id, filename, status,
-                          source, owner, repo, ref, total_vectors,
-                          persist_dir, embedder, webhook_url, error,
-                          created_at, updated_at
+                RETURNING {returning}
                 """,
                 values + [namespace, project_id],
             )
