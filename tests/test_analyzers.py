@@ -165,13 +165,13 @@ def test_go_var_declarations(sample_go_file):
 
 
 def test_go_variable_total_count(sample_go_file):
-    """Ensure we get all 8 variables: 5 consts + 4 vars."""
+    """Ensure we get all 10 variables: 5 consts + 5 vars."""
     result = analyze_go(sample_go_file)
-    assert len(result.variables) == 9
+    assert len(result.variables) == 10
     consts = [v for v in result.variables if v.kind == "const"]
     vars_ = [v for v in result.variables if v.kind == "var"]
     assert len(consts) == 5   # APIVersion, DefaultTimeout, MaxRetries, BaseURL, AllowedMethods
-    assert len(vars_) == 4    # configPath, configPath2, port, host, debug
+    assert len(vars_) == 5    # configPath, configPath2, port, host, debug
 
 
 # ---------------------------------------------------------------------------

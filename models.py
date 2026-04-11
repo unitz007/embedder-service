@@ -15,11 +15,20 @@ class FunctionInfo:
 
 
 @dataclass
+class FieldInfo:
+    """A single field within a struct, class, or interface."""
+    name: str
+    type_str: str = ""          # e.g. "int", "string", "time.Time"
+    tag: str = ""               # e.g. `json:"id" db:"id"`
+
+
+@dataclass
 class ClassInfo:
     name: str
     line: int
     docstring: str = ""
     kind: str = ""              # "class", "struct", "interface", "type_alias", "enum"
+    fields: List[FieldInfo] = field(default_factory=list)
 
 
 @dataclass
