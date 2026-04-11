@@ -16,7 +16,6 @@ from lib.embedder import (
     embed_repository_chunks,
     CodeEmbedder,
     VoyageEmbedder,
-    EmbeddingCache,
     LARGE_CODEBASE_THRESHOLD,
     EMBEDDING_DIM,
     VOYAGE_EMBEDDING_DIM,
@@ -59,7 +58,6 @@ def index_repository(
     # skipped = len(files) - len(results)
 
     return results
-
 
 
 
@@ -139,7 +137,7 @@ def full_pipeline_chroma(
     graphs_prefix: str = None,
     model_name: str = "microsoft/codebert-base",
     include_dotfiles: bool = False,
-    cache: Optional[EmbeddingCache] = None,
+    preferred_embedder: Optional[str] = None,
 ) -> tuple:
     """
     Run the complete pipeline and store vectors in Chroma instead of FAISS.
@@ -148,15 +146,17 @@ def full_pipeline_chroma(
     from deleted or renamed files survive across runs.
 
     Args:
-        repo_path:        Path to the repository to index.
-        chroma_dir:       Directory where Chroma will persist its data.
-        graphs_prefix:    Path prefix for call/import graph .pkl files.
-                          Defaults to <chroma_dir>/../vector_store so graphs
-                          land next to the Chroma dir.
-        model_name:       Embedding model (sentence-transformers).
-        include_dotfiles: Include hidden files.
-        cache:            Optional EmbeddingCache for reusing previously
-                          computed embeddings across runs.
+        repo_path:          Path to the repository to index.
+        chroma_dir:         Directory where Chroma will persist its data.
+        graphs_prefix:      Path prefix for call/import graph .pkl files.
+                            Defaults to <chroma_dir>/../vector_store so graphs
+                            land next to the Chroma dir.
+        model_name:         Embedding model (sentence-transformers).
+        include_dotfiles:   Include hidden files.
+        preferred_embedder: If set, overrides the chunk-count heuristic.
+                            Strings containing "voyage" (case-insensitive)
+                            trigger VoyageEmbedder; all other strings trigger
+                            CodeEmbedder(preferred_embedder).
 
     Returns:
         Tuple of (ChromaStore, call_graph dict, import_graph dict)
@@ -165,10 +165,6 @@ def full_pipeline_chroma(
 
     if graphs_prefix is None:
         graphs_prefix = str(Path(chroma_dir).parent / "vector_store")
-
-    # Create a cache if none was supplied — enables semantic reuse by default
-    if cache is None:
-        cache = EmbeddingCache()
 
     print(f"Starting Chroma pipeline for repository: {repo_path}")
     print("=" * 50)
@@ -189,18 +185,8 @@ def full_pipeline_chroma(
     chunks = enrich_chunks_with_graph(chunks, import_graph)
     chunks = enrich_chunks_with_call_graph(chunks, call_graph)
 
-    # Step 7: Embeddings — pick cloud or local based on codebase size
-    if len(chunks) > LARGE_CODEBASE_THRESHOLD:
-        print(
-            f"Step 7: {len(chunks)} chunks exceeds threshold "
-            f"({LARGE_CODEBASE_THRESHOLD}). Using Voyage AI cloud embedder..."
-        )
-        embedder = VoyageEmbedder(cache=cache)
-    else:
-        print(
-            f"Step 7: {len(chunks)} chunks. Using local CodeBERT embedder..."
-        )
-        embedder = CodeEmbedder(model_name, cache=cache)
+    # Step 7: Embeddings — pick cloud or local based on preference or codebase size
+    embedder = _pick_embedder(chunks, model_name, preferred_embedder)
 
     chunks_with_embeddings = generate_embeddings(chunks, embedder=embedder)
 
@@ -239,6 +225,7 @@ def full_pipeline_chroma(
         "model": VOYAGE_MODEL if is_cloud else model_name,
         "embedding_dim": VOYAGE_EMBEDDING_DIM if is_cloud else EMBEDDING_DIM,
         "use_cloud": is_cloud,
+        "preferred_embedder": preferred_embedder,
     }
     meta_path = Path(chroma_dir) / "index_meta.json"
     with open(meta_path, "w") as f:
@@ -260,29 +247,27 @@ def full_pipeline_pgvector(
     project_id: str,
     model_name: str = "microsoft/codebert-base",
     include_dotfiles: bool = False,
-    cache: Optional[EmbeddingCache] = None,
+    preferred_embedder: Optional[str] = None,
 ) -> tuple:
     """
     Run the complete pipeline and store vectors in Postgres/pgvector.
 
     Args:
-        repo_path:        Path to the repository to index.
-        namespace:        Namespace for multi-tenant storage.
-        project_id:       Project identifier.
-        model_name:       Embedding model (sentence-transformers).
-        include_dotfiles: Include hidden files.
-        cache:            Optional EmbeddingCache for reusing previously
-                          computed embeddings across runs.
+        repo_path:          Path to the repository to index.
+        namespace:          Namespace for multi-tenant storage.
+        project_id:         Project identifier.
+        model_name:         Embedding model (sentence-transformers).
+        include_dotfiles:   Include hidden files.
+        preferred_embedder: If set, overrides the chunk-count heuristic.
+                            Strings containing "voyage" (case-insensitive)
+                            trigger VoyageEmbedder; all other strings trigger
+                            CodeEmbedder(preferred_embedder).
 
     Returns:
         Tuple of (PgVectorStore, call_graph dict, import_graph dict, index_meta dict)
     """
     print(f"Starting pgvector pipeline for repository: {repo_path}")
     print("=" * 50)
-
-    # Create a cache if none was supplied — enables semantic reuse by default
-    if cache is None:
-        cache = EmbeddingCache()
 
     # Steps 1-5: Symbol extraction
     analyses = index_repository(repo_path, include_dotfiles=include_dotfiles)
@@ -300,18 +285,8 @@ def full_pipeline_pgvector(
     chunks = enrich_chunks_with_graph(chunks, import_graph)
     chunks = enrich_chunks_with_call_graph(chunks, call_graph)
 
-    # Step 7: Embeddings — pick cloud or local based on codebase size
-    if len(chunks) > LARGE_CODEBASE_THRESHOLD:
-        print(
-            f"Step 7: {len(chunks)} chunks exceeds threshold "
-            f"({LARGE_CODEBASE_THRESHOLD}). Using Voyage AI cloud embedder..."
-        )
-        embedder = VoyageEmbedder(cache=cache)
-    else:
-        print(
-            f"Step 7: {len(chunks)} chunks. Using local CodeBERT embedder..."
-        )
-        embedder = CodeEmbedder(model_name, cache=cache)
+    # Step 7: Embeddings — pick cloud or local based on preference or codebase size
+    embedder = _pick_embedder(chunks, model_name, preferred_embedder)
 
     chunks_with_embeddings = generate_embeddings(chunks, embedder=embedder)
 
@@ -332,8 +307,56 @@ def full_pipeline_pgvector(
         "model": VOYAGE_MODEL if is_cloud else model_name,
         "embedding_dim": VOYAGE_EMBEDDING_DIM if is_cloud else EMBEDDING_DIM,
         "use_cloud": is_cloud,
+        "preferred_embedder": preferred_embedder,
     }
 
     print("=" * 50)
     print("pgvector pipeline completed!")
     return store, call_graph, import_graph, index_meta
+
+
+# ---------------------------------------------------------------------------
+# Shared embedder selection logic
+# ---------------------------------------------------------------------------
+
+def _pick_embedder(
+    chunks: List[Dict[str, Any]],
+    default_model_name: str,
+    preferred_embedder: Optional[str],
+):
+    """Select the embedding model based on tenant preference or chunk count.
+
+    Priority:
+    1. If ``preferred_embedder`` is set and contains "voyage" (case-insensitive),
+       use :class:`VoyageEmbedder`.
+    2. If ``preferred_embedder`` is set to any other non-empty string,
+       use :class:`CodeEmbedder` with that model name.
+    3. Otherwise fall back to the existing ``LARGE_CODEBASE_THRESHOLD``
+       heuristic.
+    """
+    if preferred_embedder:
+        if "voyage" in preferred_embedder.lower():
+            print(
+                f"Step 7: Tenant preferred_embedder '{preferred_embedder}' "
+                f"detected as Voyage model. Using Voyage AI cloud embedder..."
+            )
+            return VoyageEmbedder()
+        else:
+            print(
+                f"Step 7: Tenant preferred_embedder '{preferred_embedder}'. "
+                f"Using local CodeEmbedder..."
+            )
+            return CodeEmbedder(preferred_embedder)
+
+    # Existing size-based heuristic
+    if len(chunks) > LARGE_CODEBASE_THRESHOLD:
+        print(
+            f"Step 7: {len(chunks)} chunks exceeds threshold "
+            f"({LARGE_CODEBASE_THRESHOLD}). Using Voyage AI cloud embedder..."
+        )
+        return VoyageEmbedder()
+
+    print(
+        f"Step 7: {len(chunks)} chunks. Using local CodeBERT embedder..."
+    )
+    return CodeEmbedder(default_model_name)
