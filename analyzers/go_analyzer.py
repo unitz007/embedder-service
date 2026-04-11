@@ -3,7 +3,7 @@
 import tree_sitter_go
 from tree_sitter import Language, Parser
 from typing import List
-from models import FileAnalysis, FunctionInfo, ClassInfo
+from models import FileAnalysis, FunctionInfo, ClassInfo, FieldInfo
 
 GO_LANGUAGE_PTR = tree_sitter_go.language()
 GO_LANGUAGE = Language(GO_LANGUAGE_PTR)
@@ -53,6 +53,52 @@ def _get_package(root) -> str:
             if name_node:
                 return name_node.text.decode()
     return ""
+
+
+def _extract_struct_fields(type_node, code: bytes) -> List[FieldInfo]:
+    """Extract field definitions from a struct_type node."""
+    fields: List[FieldInfo] = []
+
+    for child in type_node.children:
+        if child.type == "field_definition":
+            # Determine field name
+            field_name = ""
+            field_identifier_nodes = _find_nodes_of_type(child, "field_identifier")
+            if field_identifier_nodes:
+                field_name = field_identifier_nodes[0].text.decode()
+            elif child.child_by_field_name("name") is not None:
+                # Could be a blank identifier (_)
+                name_node = child.child_by_field_name("name")
+                if name_node:
+                    field_name = name_node.text.decode()
+            # If neither field_identifier nor name child, it's an embedded field → name=""
+
+            # Determine field type: everything except the name and tag children
+            # Use the "type" field directly if available (works for named fields)
+            type_node_child = child.child_by_field_name("type")
+            if type_node_child:
+                type_str = type_node_child.text.decode()
+            else:
+                # Embedded field: the entire node text (minus tag) is the type
+                tag_node = child.child_by_field_name("tag")
+                if tag_node:
+                    type_str = code[child.start_byte:tag_node.start_byte].decode("utf-8", errors="ignore").strip()
+                else:
+                    type_str = child.text.decode("utf-8", errors="ignore").strip()
+
+            # Determine struct tag
+            tag = ""
+            tag_node = child.child_by_field_name("tag")
+            if tag_node:
+                tag = tag_node.text.decode()
+
+            fields.append(FieldInfo(
+                name=field_name,
+                type_str=type_str,
+                tag=tag,
+            ))
+
+    return fields
 
 
 def analyze_go(file_path):
@@ -117,17 +163,12 @@ def analyze_go(file_path):
                 name_node = spec.child_by_field_name("name")
                 type_node = spec.child_by_field_name("type")
                 if name_node:
-                    # Extract generic type parameters if present
-                    type_params = ""
-                    for c in spec.children:
-                        if c.type == "type_parameter_list":
-                            type_params = c.text.decode("utf-8", errors="ignore")
-                            break
-
                     kind = "type_alias"
+                    struct_fields: List[FieldInfo] = []
                     if type_node:
                         if type_node.type == "struct_type":
                             kind = "struct"
+                            struct_fields = _extract_struct_fields(type_node, code)
                         elif type_node.type == "interface_type":
                             kind = "interface"
                     start = spec.start_point[0]
@@ -136,7 +177,7 @@ def analyze_go(file_path):
                         line=start,
                         docstring=_get_leading_comments(source_lines, start),
                         kind=kind,
-                        type_params=type_params,
+                        fields=struct_fields,
                     ))
 
         # Import declarations

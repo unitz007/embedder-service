@@ -15,12 +15,20 @@ class FunctionInfo:
 
 
 @dataclass
+class FieldInfo:
+    """Represents a single field within a Go struct definition."""
+    name: str                  # Field name ("" for embedded fields, "_" for blank identifiers)
+    type_str: str              # Raw type text, e.g. "string", "*User", "[]int"
+    tag: str                   # Raw struct tag string, e.g. `json:"name,omitempty"`, or "" if absent
+
+
+@dataclass
 class ClassInfo:
     name: str
     line: int
     docstring: str = ""
     kind: str = ""              # "class", "struct", "interface", "type_alias", "enum"
-    type_params: str = ""       # Generic type parameters e.g. "[T comparable, V any]"
+    fields: List[FieldInfo] = field(default_factory=list)
 
 
 @dataclass
