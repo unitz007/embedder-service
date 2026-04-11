@@ -2,8 +2,8 @@
 
 import tree_sitter_go
 from tree_sitter import Language, Parser
-from typing import List
-from models import FileAnalysis, FunctionInfo, ClassInfo
+from typing import List, Optional
+from models import FileAnalysis, FunctionInfo, ClassInfo, FieldInfo
 
 GO_LANGUAGE_PTR = tree_sitter_go.language()
 GO_LANGUAGE = Language(GO_LANGUAGE_PTR)
@@ -53,6 +53,47 @@ def _get_package(root) -> str:
             if name_node:
                 return name_node.text.decode()
     return ""
+
+
+def _extract_struct_fields(struct_type_node, code: bytes) -> List[FieldInfo]:
+    """
+    Extract field info from a struct_type node's field_definition children.
+
+    In tree-sitter-go, each field_definition node has:
+      - A "field_identifier" child for named fields
+      - A "tag" child (optional) for struct tags like `json:"name,omitempty"`
+      - A type child (direct child, not nested) for the field type
+
+    Embedded fields (e.g. `http.Handler`) have no field_identifier child.
+    Blank identifier fields (e.g. `_ int`) have field_identifier text "_".
+    """
+    fields: List[FieldInfo] = []
+
+    for child in struct_type_node.children:
+        if child.type != "field_definition":
+            continue
+
+        field_name = ""
+        type_str = ""
+        tag_str = ""
+
+        # Look at direct children to extract name, type, and tag
+        for fd_child in child.children:
+            if fd_child.type == "field_identifier":
+                field_name = fd_child.text.decode("utf-8", errors="ignore")
+            elif fd_child.type == "tag":
+                tag_str = fd_child.text.decode("utf-8", errors="ignore")
+            # The type is any direct child that is not field_identifier, tag, or comment
+            elif fd_child.type not in ("comment", "field_identifier", "tag"):
+                type_str = fd_child.text.decode("utf-8", errors="ignore")
+
+        fields.append(FieldInfo(
+            name=field_name,
+            type_str=type_str,
+            tag=tag_str,
+        ))
+
+    return fields
 
 
 def analyze_go(file_path):
@@ -125,9 +166,11 @@ def analyze_go(file_path):
                             break
 
                     kind = "type_alias"
+                    struct_fields: List[FieldInfo] = []
                     if type_node:
                         if type_node.type == "struct_type":
                             kind = "struct"
+                            struct_fields = _extract_struct_fields(type_node, code)
                         elif type_node.type == "interface_type":
                             kind = "interface"
                     start = spec.start_point[0]
@@ -137,6 +180,7 @@ def analyze_go(file_path):
                         docstring=_get_leading_comments(source_lines, start),
                         kind=kind,
                         type_params=type_params,
+                        fields=struct_fields,
                     ))
 
         # Import declarations

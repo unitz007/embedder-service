@@ -192,6 +192,7 @@ def chunk_file_analysis(analysis: FileAnalysis) -> List[Dict[str, Any]]:
                 "symbol_name": cls.name,
                 "docstring": cls.docstring,
                 "package": analysis.package,
+                "fields": [{"name": f.name, "type_str": f.type_str, "tag": f.tag} for f in cls.fields],
                 "content": class_body,
             },
         })
