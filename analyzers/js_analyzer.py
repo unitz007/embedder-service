@@ -3,7 +3,7 @@
 import tree_sitter_javascript
 from tree_sitter import Language, Parser
 from typing import List
-from models import FileAnalysis, FunctionInfo, ClassInfo
+from models import FileAnalysis, FunctionInfo, ClassInfo, VariableInfo
 
 JS_LANGUAGE_PTR = tree_sitter_javascript.language()
 JS_LANGUAGE = Language(JS_LANGUAGE_PTR)
@@ -46,12 +46,21 @@ def _get_signature(node, source_lines: List[str]) -> str:
     return ""
 
 
-def _extract_from_node(node, functions, classes, imports, source_lines):
+def _declaration_keyword(node) -> str:
+    """Return 'const', 'let', or 'var' for a lexical/variable declaration node."""
+    for child in node.children:
+        if child.type in ("const", "let", "var"):
+            return child.text.decode("utf-8", errors="ignore")
+    return "const"
+
+
+def _extract_from_node(node, functions, classes, imports, variables, source_lines):
     """
     Recursively extract symbols from a node, covering common JS/TS patterns:
       - function declarations (including generators)
       - class declarations and their methods
       - const/let arrow functions and function expressions
+      - const/let/var with non-function values (primitives, objects, arrays, etc.)
       - export statements (recurse into declaration)
       - import statements
     """
@@ -94,12 +103,13 @@ def _extract_from_node(node, functions, classes, imports, source_lines):
                         ))
 
     elif t in ("lexical_declaration", "variable_declaration"):
-        # const foo = () => {} or const foo = function() {}
+        keyword = _declaration_keyword(node)
         for child in node.children:
             if child.type == "variable_declarator":
                 name_node = child.child_by_field_name("name")
                 value_node = child.child_by_field_name("value")
                 if name_node and value_node and value_node.type in ("arrow_function", "function_expression"):
+                    # Treat as function
                     start = child.start_point[0]
                     functions.append(FunctionInfo(
                         name=name_node.text.decode(),
@@ -107,11 +117,22 @@ def _extract_from_node(node, functions, classes, imports, source_lines):
                         signature=_get_signature(child, source_lines),
                         docstring=_get_leading_comment(source_lines, start),
                     ))
+                elif name_node and value_node:
+                    # Treat as variable — non-function value
+                    start = child.start_point[0]
+                    value_text = value_node.text.decode("utf-8", errors="ignore")
+                    variables.append(VariableInfo(
+                        name=name_node.text.decode(),
+                        line=start,
+                        kind=keyword,  # "const", "let", or "var"
+                        value=value_text[:120] if len(value_text) > 120 else value_text,
+                        docstring=_get_leading_comment(source_lines, start),
+                    ))
 
     elif t == "export_statement":
         declaration = node.child_by_field_name("declaration")
         if declaration:
-            _extract_from_node(declaration, functions, classes, imports, source_lines)
+            _extract_from_node(declaration, functions, classes, imports, variables, source_lines)
 
     elif t == "import_statement":
         source_node = node.child_by_field_name("source")
@@ -133,9 +154,10 @@ def analyze_js(file_path):
     functions: List[FunctionInfo] = []
     classes: List[ClassInfo] = []
     imports: List[str] = []
+    variables: List[VariableInfo] = []
 
     for node in root.children:
-        _extract_from_node(node, functions, classes, imports, source_lines)
+        _extract_from_node(node, functions, classes, imports, variables, source_lines)
 
     return FileAnalysis(
         file_path=file_path,
@@ -143,4 +165,5 @@ def analyze_js(file_path):
         functions=functions,
         classes=classes,
         imports=imports,
+        variables=variables,
     )
