@@ -1,379 +1,241 @@
 # Architecture
 
-## Overview
-
-The Code Indexer Service is a Python/FastAPI HTTP service that turns codebases
-into searchable vector databases. It clones or receives source code, parses it
-into structured symbols (functions, classes, imports), builds relationship
-graphs, generates vector embeddings, and stores everything in Postgres/pgvector
-for semantic search.
-
-```mermaid
-graph LR
-    subgraph Clients
-        CLI[curl / SDK]
-        Web[Web UI]
-    end
-
-    CLI -->|HTTP| API[FastAPI<br/>main.py]
-    Web -->|HTTP| API
-
-    subgraph Indexing Pipeline
-        API -->|Queue job| Jobs[Job Tracker<br/>db.py]
-        Jobs -->|Background| Scan[File Scanner<br/>file_scanner.py]
-        Scan -->|Files| Lang[Language Router<br/>language_router.py]
-        Lang -->|Per file| Analyzers[Analyzers<br/>python, go, js, ...]
-        Analyzers -->|FileAnalysis| Chunker[Chunker<br/>chunker.py]
-        Analyzers -->|Analyses| Graphs[Graph Builder<br/>graph.py]
-        Graphs -->|Enrich| Chunker
-        Chunker -->|Chunks| Embedder[Embedder<br/>embedder.py]
-        Embedder -->|Vectors| Store[pgvector<br/>store/pgvector_store.py]
-    end
-
-    subgraph Query Path
-        API -->|POST /search/text| QEmbed[Embedder]
-        QEmbed -->|Query vector| Store
-        Store -->|Top-k results| API
-    end
-
-    subgraph Storage
-        PG[(Postgres<br/>+ pgvector)]
-    end
-
-    Store --> PG
-    Jobs --> PG
-```
-
-## Core Components
-
-### 1. API Layer (`main.py`)
-
-The FastAPI application that exposes all HTTP endpoints. Built with:
-
-- **FastAPI** with Pydantic v2 request/response models
-- **Background tasks** for long-running indexing jobs
-- **Bearer token auth** on management endpoints (upload, delete, job status)
-- **Webhook notifications** with optional HMAC-SHA256 signatures
-
-**Endpoints:**
-
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /github/index` | Queue a GitHub repo or local path for indexing |
-| `POST /embeddings/{ns}/{pid}` | Upload a zip and index it |
-| `POST /search/text` | Search with raw query text (auto-picks model) |
-| `POST /search` | Search with a pre-computed embedding vector |
-| `POST /embed` | Embed arbitrary text |
-| `GET /embeddings/{ns}/{pid}` | Read index metadata |
-| `DELETE /embeddings/{ns}/{pid}` | Delete a project's index |
-| `GET /jobs/{job_id}` | Poll indexing job status |
-| `GET /` | Serve the built-in API documentation UI |
-
-### 2. Database Layer (`db.py`)
-
-Manages a Postgres connection pool via `psycopg2` and provides:
-
-- **Schema initialisation** — Creates `jobs`, `index_meta`, and `embeddings`
-  tables with the `vector` extension on startup.
-- **Job CRUD** — Create, update, and poll indexing jobs with status tracking
-  (`queued → downloading → running → completed/failed`).
-- **Index metadata** — Stores which embedding model and dimension were used for
-  each project, enabling automatic model selection at query time.
-- **Embedding storage** — `upsert` semantics with `(namespace, project_id, chunk_id)`
-  uniqueness so re-indexing updates vectors in place.
-
-The `embeddings` table stores `vector(768)` columns (CodeBERT dimension) with an
-IVFFlat cosine-similarity index. If the table was previously created with a
-different dimension it is automatically dropped and recreated.
-
-### 3. File Scanning (`utils/file_scanner.py`)
-
-Walks a repository tree and yields source file paths. Prunes:
-
-- VCS directories (`.git`, `.svn`, `.hg`)
-- Dependency/build directories (`node_modules`, `vendor`, `__pycache__`, etc.)
-- Binary files by extension (images, archives, compiled files, lock files)
-- Generated files (`.min.js`, `.pb.go`, `_gen.go`, etc.)
-- Files larger than 512 KB
-
-Supports an `include_dotfiles` mode for indexing dotfile repositories.
-
-### 4. Language Router (`utils/language_router.py`)
-
-Maps file paths to language names using a three-tier detection:
-
-1. **Exact filename match** — Handles extensionless dotfiles (`.zshrc`,
-   `.gitconfig`, `Makefile`, `Dockerfile`, etc.)
-2. **Extension match** — `.py` → python, `.go` → go, `.rs` → rust, etc.
-3. **Shebang line** — Reads the first line for `#!/usr/bin/env python` etc.
-
-Dispatches to the appropriate analyzer function.
-
-### 5. Analyzers (`analyzers/`)
-
-Each analyzer parses a source file and returns a `FileAnalysis` containing:
-
-- **Functions** — Name, line, signature, docstring, params, return type
-- **Classes** — Name, line, docstring, kind (struct/interface/class/enum)
-- **Imports** — List of import paths
-- **Package** — Go package name, Python module path, etc.
-
-| Analyzer | Approach | Languages |
-|----------|----------|-----------|
-| `python_analyzer.py` | Python `ast` module | Python |
-| `go_analyzer.py` | tree-sitter-go | Go |
-| `js_analyzer.py` | tree-sitter-javascript | JavaScript, TypeScript |
-| `generic_ts_analyzer.py` | Config-driven tree-sitter | Rust, Java, Ruby, C, C++, Lua |
-| `shell_analyzer.py` | Regex patterns | Bash, zsh, fish |
-| `config_analyzer.py` | stdlib parsers (PyYAML, tomllib, json, configparser) | YAML, TOML, JSON, INI, .env, .gitignore, etc. |
-
-The `generic_ts_analyzer` uses a `LanguageProfile` dataclass to describe each
-language's tree-sitter node types, name-extraction strategies, and doc comment
-types. Adding a new tree-sitter language only requires adding a profile dict.
-
-### 6. Chunker (`lib/chunker.py`)
-
-Breaks each `FileAnalysis` into embedding-ready chunks:
-
-1. **Imports chunk** — All import statements from the file
-2. **Function chunks** — One per function/method, including the function body
-   with surrounding context lines
-3. **Class chunks** — One per class/struct/interface with its body
-4. **File summary chunk** — Compact overview listing all symbols and imports
-5. **Full-file fallback** — If no symbols were extracted, the entire file is
-   chunked as-is
-
-Each chunk carries rich metadata: file path, language, symbol name, signature,
-docstring, params, return type, line number, package, and graph relationships.
-
-### 7. Graph Builder (`lib/graph.py`)
-
-Builds two complementary graphs from the parsed analyses:
-
-**Import graph** (file-level):
-- `depends_on` — Local files this file imports
-- `imported_by` — Local files that import this file
-- Resolves Python dotted imports, JS relative paths, and Go package paths
-
-**Call graph** (symbol-level):
-- `calls` — Local functions this function calls
-- `called_by` — Local functions that call this function
-- `external_calls` — Unresolved calls (stdlib/third-party)
-- Built for Python (via `ast.walk`), Go (via tree-sitter), and JS (via tree-sitter)
-
-Both graphs are injected into chunk metadata so search results carry relational
-context. The LLM can answer questions like "What calls `authenticate()`?" or
-"What does `UserService.Create` depend on?".
-
-### 8. Embedder (`lib/embedder.py`)
-
-Two embedding strategies, selected automatically based on codebase size:
-
-**Local: `CodeEmbedder`** (microsoft/codebert-base)
-- 768-dimensional vectors
-- Uses HuggingFace transformers with masked mean pooling
-- No API key required
-- Falls back to `sentence-transformers` for non-CodeBERT models
-- Further fallback to random embeddings if nothing is available
-
-**Cloud: `VoyageEmbedder`** (voyage-code-3)
-- 1024-dimensional vectors
-- REST API calls to Voyage AI
-- Requires `VOYAGE_API_KEY` environment variable
-- Batched requests (128 texts per API call)
-- Used when the codebase produces more than `LARGE_CODEBASE_THRESHOLD` chunks
-
-The threshold is configurable via the `LARGE_CODEBASE_THRESHOLD` constant
-(default: 99 999 chunks). This ensures small repos index quickly with no
-external dependency, while large repos benefit from a superior code embedding
-model.
-
-### 9. Vector Stores (`store/`)
-
-#### pgvector Store (`store/pgvector_store.py`) — Primary
-
-- Stores embeddings as `vector(768)` columns in Postgres
-- Uses `psycopg2.extras.execute_values` for batched upserts (200 rows/batch)
-- Deterministic chunk IDs via MD5 hash of `(file_path, chunk_type, symbol_name, line_number)`
-- `replace_all` mode: upserts new vectors then deletes stale ones from previous runs
-- Cosine-similarity search via IVFFlat index (`embedding <=> query_vector`)
-- Returns `(metadata, similarity_score, rank)` tuples
-
-#### Chroma Store (`store/chroma_store.py`) — Alternative
-
-- Embedded ChromaDB with SQLite persistence
-- Same interface as the pgvector store
-- Handles ChromaDB's `SQLITE_READONLY_DBMOVED` pitfalls with a single shared
-  `PersistentClient` per directory and careful collection management
-- JSON-encodes list metadata fields (Chroma only accepts scalars)
-- Used by the standalone `full_pipeline_chroma()` pipeline
-
-#### Project Store (`store/project_store.py`)
-
-- JSON-file-backed store for project metadata
-- Thread-safe with file locking
-- Independent of any vector index
-
-### 10. Web UI (`web/index.html`)
-
-A single-page API documentation site served at the root URL. Styled with custom
-CSS and provides interactive endpoint documentation with request/response
-examples, parameter tables, and copy-to-clipboard support.
-
-## Data Flow
-
-### Indexing Pipeline
+## System Overview
 
 ```
-Repository
-  │
-  ├─ 1. File Scanner ─── walk tree, filter by extension/size
-  │
-  ├─ 2. Language Router ─ map each file → language name
-  │
-  ├─ 3. Analyzers ─── parse AST, extract FileAnalysis
-  │     (functions, classes, imports, docstrings)
-  │
-  ├─ 4. Graph Builder
-  │     ├─ Import graph (file-level dependencies)
-  │     └─ Call graph (symbol-level callers/callees)
-  │
-  ├─ 5. Chunker ─── split into embedding-ready chunks
-  │     (inject graph data into each chunk's metadata)
-  │
-  ├─ 6. Embedder ─── generate vectors
-  │     ├─ ≤ threshold → CodeBERT (local, 768-d)
-  │     └─ > threshold → Voyage AI (cloud, 1024-d)
-  │
-  └─ 7. Vector Store ─── upsert into Postgres/pgvector
-        (with index metadata for model auto-detection)
+                        ┌─────────────────────────────────────────────┐
+                        │              Client (curl / app)            │
+                        └─────────────┬───────────────┬─────────────┘
+                                      │               │
+                              POST /api/index   POST /api/search
+                                      │               │
+                        ┌─────────────▼───────────────▼─────────────┐
+                        │            Flask Application               │
+                        │              (main.py)                     │
+                        │                                            │
+                        │  ┌──────────┐  ┌───────────┐  ┌────────┐  │
+                        │  │ /api/*   │  │ Background │  │ Health │  │
+                        │  │ Routes   │  │ Job Thread │  │  Check │  │
+                        │  └────┬─────┘  └─────┬─────┘  └────────┘  │
+                        └───────┼──────────────┼────────────────────┘
+                                │              │
+                 ┌──────────────▼──┐   ┌───────▼────────────────────┐
+                 │  File Scanner   │   │  Indexing Pipeline         │
+                 │  (utils/)       │   │  (indexing/full_pipeline)  │
+                 │                 │   │                            │
+                 │  ┌───────────┐  │   │  1. scan_repository()     │
+                 │  │ Ignore    │  │   │  2. analyze_file() × N    │
+                 │  │ Patterns  │  │   │  3. build_import_graph()  │
+                 │  └───────────┘  │   │  4. build_call_graph()    │
+                 │                 │   │  5. chunk_repository_...() │
+                 └────────┬────────┘   │  6. embed_chunks()        │
+                          │            │  7. store.add_vectors()   │
+                 ┌────────▼────────┐   └────────┬──────────────────┘
+                 │ Language Router │            │
+                 │ (utils/)        │   ┌────────▼────────┐
+                 │                 │   │  Vector Store    │
+                 │ .py → Python    │   │                  │
+                 │ .go → Go        │   │ ┌─────────────┐ │
+                 │ .js → JS/TS     │   │ │  pgvector   │ │
+                 │ .sh → Shell     │   │ │  (prod)     │ │
+                 │ .rs → Rust …    │   │ └─────────────┘ │
+                 └────────┬────────┘   │ ┌─────────────┐ │
+                          │            │ │  ChromaDB   │ │
+                 ┌────────▼────────┐   │ │  (local)    │ │
+                 │   Analyzers     │   │ └─────────────┘ │
+                 │ (analyzers/)    │   └────────┬────────┘
+                 │                 │            │
+                 │ Python: ast     │   ┌────────▼────────┐
+                 │ Go: tree-sitter │   │  PostgreSQL     │
+                 │ JS: tree-sitter │   │                 │
+                 │ Generic: TS     │   │  • jobs table   │
+                 │ Config: stdlib  │   │  • index_meta   │
+                 └─────────────────┘   │  • embeddings   │
+                                       └─────────────────┘
 ```
 
-### Search Query Flow
+## Tech Stack
+
+| Component | Technology | Notes |
+|---|---|---|
+| Web framework | **Flask** + flask-cors | Single-process, threaded, runs on port 8001 |
+| Database | **PostgreSQL** + pgvector extension | `ThreadedConnectionPool` via psycopg2 |
+| Local embeddings | `microsoft/codebert-base` | HuggingFace transformers + sentence-transformers, 768-dim |
+| Cloud embeddings | `voyage-code-3` via Voyage AI API | 1024-dim, batched (128 texts/request) |
+| Local vector store | **ChromaDB** | Embedded, cosine distance, SQLite-backed |
+| Production vector store | **pgvector** | `vector(768)`, IVFFlat index with cosine ops |
+| AST parsing | **tree-sitter** (Go, JS, Rust, Java, Ruby, C, C++, Lua) + Python `ast` stdlib | Regex fallback for Python syntax errors |
+
+## Module Breakdown
+
+| File / Directory | Responsibility |
+|---|---|
+| `main.py` | Flask application, route definitions, `before_request` auth middleware, background indexing job runner (`_run_index_job`), git clone helper (`_clone_repo`) |
+| `db.py` | `ThreadedConnectionPool` management, `init_db()` schema creation, CRUD operations for `jobs`, `index_meta`, and `embeddings` tables |
+| `models.py` | Shared dataclasses: `FunctionInfo`, `ClassInfo`, `FieldInfo`, `VariableInfo`, `FileAnalysis` |
+| `pipeline.py` | Standalone `run_indexing()` entry-point for programmatic use (chunk → embed → pgvector) |
+| `requirements.txt` | Python dependency declarations |
+| `analyzers/python_analyzer.py` | Python AST analysis via `ast` module with regex fallback on `SyntaxError`. Extracts functions, classes, decorators, module-level variables, and class-level variables |
+| `analyzers/go_analyzer.py` | Go analysis via tree-sitter-go. Extracts functions, methods, structs (with struct tags), interfaces, type aliases, and const/var declarations |
+| `analyzers/js_analyzer.py` | JavaScript/TypeScript analysis via tree-sitter-javascript. Extracts functions, classes, methods, arrow functions, and const/let/var variables |
+| `analyzers/shell_analyzer.py` | Shell script analysis via regex. Extracts functions, aliases, exports, and source/include paths |
+| `analyzers/generic_ts_analyzer.py` | Config-driven tree-sitter analyzer for Rust, Java, Ruby, C, C++, and Lua. Uses `LanguageProfile` dataclass to describe each language's node types and naming strategies |
+| `analyzers/config_analyzer.py` | Configuration file analysis. Supports YAML (PyYAML), TOML (tomllib/tomli), JSON (stdlib), INI (configparser), and a generic key-value fallback for .env, .gitignore, SSH config, etc. |
+| `lib/chunker.py` | Splits `FileAnalysis` objects into typed chunks: `function`, `class`, `variable`, `imports`, `file_summary`, and `file`. Each chunk carries a `content` string (for embedding) and a `metadata` dict (for LLM context) |
+| `lib/embedder.py` | `CodeEmbedder` (local HuggingFace) and `VoyageEmbedder` (cloud API). Both implement `encode(texts)` and `embed_chunks(chunks)`. Includes `EmbeddingCache` for cross-project deduplication |
+| `lib/graph.py` | Builds two complementary graphs: (1) **import graph** — file-level `depends_on`/`imported_by` edges; (2) **call graph** — symbol-level `calls`/`called_by`/`external_calls` edges. Graph data is injected into chunk metadata |
+| `store/pgvector_store.py` | `PgVectorStore` — inserts embeddings via `INSERT … ON CONFLICT DO UPDATE`, cosine similarity search via `<=>` operator, batch size of 200 |
+| `store/chroma_store.py` | `ChromaStore` — wraps a ChromaDB collection with upsert, cosine distance search, per-file deletion, and SQLite connection caching to avoid `SQLITE_READONLY_DBMOVED` |
+| `store/project_store.py` | `ProjectStore` — thread-safe, JSON-file-backed project registry (not used by the Flask API; available for tooling) |
+| `utils/file_scanner.py` | `scan_repository()` — walks a directory tree, skipping VCS dirs, build outputs, IDE files, binaries, generated files, and files > 512 KB |
+| `utils/language_router.py` | `detect_language()` — maps file paths to language names via extension map, filename map, and shebang detection. `analyze_file()` dispatches to the correct analyzer |
+| `indexing/full_pipeline.py` | `full_pipeline_pgvector()` and `full_pipeline_chroma()` — end-to-end pipeline functions that orchestrate scanning, analysis, chunking, graph building, embedding, and storage |
+| `web/index.html` | Static API documentation page (not served by Flask; meant for standalone viewing or deployment behind a static file server) |
+
+## Data Flow — Indexing Pipeline
 
 ```
-Client sends POST /search/text { namespace, project_id, query }
-  │
-  ├─ 1. Read index_meta from DB ─ determine which model was used
-  │
-  ├─ 2. Embed the query text with the correct model
-  │     (VoyageEmbedder or CodeEmbedder)
-  │
-  ├─ 3. Search pgvector ─ cosine similarity ORDER BY LIMIT k
-  │
-  └─ 4. Return results with metadata, similarity scores, and ranks
+1. scan_repository(repo_path)
+   └── Walk directory tree → list of source file paths
+
+2. analyze_file(file_path)  × N files
+   └── language_router detects language
+   └── dispatches to correct analyzer
+   └── returns FileAnalysis (functions, classes, imports, variables, package)
+
+3. build_import_graph(analyses)
+   └── Resolves import strings to local file paths
+   └── Returns {file_path: {depends_on: [...], imported_by: [...]}}
+
+4. build_call_graph(analyses)
+   └── For Python: walks AST Call nodes
+   └── For Go/JS: walks tree-sitter call_expression nodes
+   └── Returns {"file::func": {calls: [...], called_by: [...], external_calls: [...]}}
+
+5. chunk_repository_analyses(analyses)
+   └── Creates chunks: imports, function, class, variable, file_summary, file
+   └── Each chunk = {content: str, type: str, metadata: dict}
+
+6. enrich_chunks_with_graph() + enrich_chunks_with_call_graph()
+   └── Injects import graph and call graph data into chunk metadata
+
+7. embedder.embed_chunks(chunks)
+   └── CodeEmbedder: local HuggingFace inference (batched, mean-pooled, L2-normalised)
+   └── VoyageEmbedder: cloud API (batched 128 texts, 1024-dim)
+   └── Model selected by: per-tenant override > chunk count heuristic (> 99 999 → cloud)
+
+8. store.add_vectors(embeddings, metadata, replace_all=True)
+   └── pgvector: INSERT ... ON CONFLICT DO UPDATE in batches of 200
+   └── ChromaDB: upsert in batches of 5000, then delete stale IDs
 ```
-
-### Dimension Mismatch Handling
-
-The `/search` endpoint accepts a pre-computed embedding. If the dimension
-doesn't match the stored index, the server checks for an accompanying `text`
-field. If present, it re-embeds the text with the correct model automatically
-instead of returning an error. This transparent fallback means callers don't
-need to track which embedder was used at index time.
 
 ## Database Schema
 
-```sql
--- Indexing jobs
-CREATE TABLE jobs (
-    job_id TEXT PRIMARY KEY,
-    namespace TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    filename TEXT,
-    status TEXT NOT NULL,           -- queued | downloading | running | completed | failed
-    source TEXT,                    -- github | local | upload
-    owner TEXT,
-    repo TEXT,
-    ref TEXT,
-    total_vectors INTEGER,
-    persist_dir TEXT,
-    embedder TEXT,
-    webhook_url TEXT,
-    error TEXT,
-    created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL
-);
+### `jobs` table
 
--- Index metadata (which model/dimension was used)
-CREATE TABLE index_meta (
-    namespace TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    embedder TEXT,                  -- CodeEmbedder | VoyageEmbedder
-    model TEXT,                     -- microsoft/codebert-base | voyage-code-3
-    embedding_dim INTEGER,          -- 768 | 1024
-    use_cloud BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (namespace, project_id)
-);
+Tracks indexing job lifecycle.
 
--- Embedding vectors with metadata
-CREATE TABLE embeddings (
-    id BIGSERIAL PRIMARY KEY,
-    namespace TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    chunk_id TEXT NOT NULL,         -- deterministic MD5 hash
-    file_path TEXT,
-    chunk_type TEXT,                -- function | class | imports | file_summary | file
-    symbol_name TEXT,
-    line_number INTEGER,
-    content TEXT,                   -- source text used for embedding
-    metadata JSONB,                 -- all chunk metadata as JSON
-    embedding vector(768),
-    created_at TIMESTAMPTZ NOT NULL,
-    UNIQUE (namespace, project_id, chunk_id)
-);
+| Column | Type | Description |
+|---|---|---|
+| `job_id` | `TEXT PK` | UUID v4 job identifier |
+| `namespace` | `TEXT NOT NULL` | Tenant namespace |
+| `project_id` | `TEXT NOT NULL` | Project identifier |
+| `filename` | `TEXT` | Repository URL |
+| `status` | `TEXT NOT NULL` | `queued`, `running`, `complete`, or `failed` |
+| `source` | `TEXT` | Source type (e.g. `"git"`) |
+| `owner` | `TEXT` | Repository owner (reserved) |
+| `repo` | `TEXT` | Repository name (reserved) |
+| `ref` | `TEXT` | Git ref used for cloning |
+| `total_vectors` | `INTEGER` | Vector count after successful indexing |
+| `persist_dir` | `TEXT` | Chroma persist directory (legacy) |
+| `embedder` | `TEXT` | Embedder class name used |
+| `webhook_url` | `TEXT` | Webhook URL for job notifications |
+| `error` | `TEXT` | Error message on failure |
+| `created_at` | `TIMESTAMPTZ NOT NULL` | Job creation time |
+| `updated_at` | `TIMESTAMPTZ NOT NULL` | Last status update time |
 
--- Cosine similarity index
-CREATE INDEX embeddings_vec_idx
-    ON embeddings USING ivfflat (embedding vector_cosine_ops);
+### `index_meta` table
+
+Stores per-project embedding model configuration.
+
+| Column | Type | Description |
+|---|---|---|
+| `namespace` | `TEXT PK` | Tenant namespace |
+| `project_id` | `TEXT PK` | Project identifier |
+| `embedder` | `TEXT` | Embedder class name (e.g. `"CodeEmbedder"`, `"VoyageEmbedder"`) |
+| `model` | `TEXT` | Model identifier (e.g. `"microsoft/codebert-base"`, `"voyage-code-3"`) |
+| `embedding_dim` | `INTEGER` | Vector dimensionality (768 or 1024) |
+| `use_cloud` | `BOOLEAN DEFAULT FALSE` | Whether cloud embedder was used |
+| `preferred_embedder` | `TEXT` | Per-tenant model override (e.g. `"voyage-code-3"`, `null`) |
+| `created_at` | `TIMESTAMPTZ NOT NULL` | First index creation time |
+| `updated_at` | `TIMESTAMPTZ NOT NULL` | Last index update time |
+
+Primary key: `(namespace, project_id)`.
+
+### `embeddings` table
+
+Stores embedding vectors with their metadata.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `BIGSERIAL PK` | Auto-incrementing row ID |
+| `namespace` | `TEXT NOT NULL` | Tenant namespace |
+| `project_id` | `TEXT NOT NULL` | Project identifier |
+| `chunk_id` | `TEXT NOT NULL` | MD5 hash of `file_path::chunk_type::symbol_name::line_number` |
+| `file_path` | `TEXT` | Source file path |
+| `chunk_type` | `TEXT` | `function`, `class`, `variable`, `imports`, `file_summary`, or `file` |
+| `symbol_name` | `TEXT` | Symbol identifier (function name, class name, etc.) |
+| `line_number` | `INTEGER` | Source line number |
+| `content` | `TEXT` | Source text of the chunk |
+| `metadata` | `JSONB` | Full metadata dict (package, signature, docstring, params, etc.) |
+| `embedding` | `vector(768)` | Normalised embedding vector |
+| `created_at` | `TIMESTAMPTZ NOT NULL` | Insertion time |
+
+Indexes:
+- Unique: `(namespace, project_id, chunk_id)`
+- IVFFlat: `embeddings_vec_idx` on `embedding vector_cosine_ops`
+
+## Vector Store Comparison
+
+| Feature | pgvector (production) | ChromaDB (local) |
+|---|---|---|
+| **Storage backend** | PostgreSQL table | Embedded SQLite |
+| **Isolation** | Multi-tenant via `namespace` + `project_id` columns | Single collection per persist directory |
+| **Vector index** | IVFFlat (cosine) | HNSW (cosine) |
+| **Deletion** | `DELETE WHERE namespace = %s AND project_id = %s` | `delete_by_file()` or `clear()` |
+| **Persistence** | Automatic (Postgres WAL) | Automatic (Chroma writes on every upsert) |
+| **Upsert** | `ON CONFLICT DO UPDATE` | Chroma `upsert` by ID |
+| **Used by** | Flask API (`POST /api/index`, `POST /api/search`) | Standalone pipeline (`full_pipeline_chroma()`) |
+| **Best for** | Production deployments, multi-tenant SaaS | Local development, offline/embedded use |
+
+## Authentication & Webhooks
+
+### Authentication
+
+All `/api/*` routes are protected by a `before_request` hook in Flask. When the `API_KEY` environment variable is set, every request must include:
+
+```
+Authorization: Bearer <API_KEY>
 ```
 
-## Chunk Metadata Schema
+If the header is missing or incorrect, the server returns `401 Unauthorized` with `{"error": "Unauthorized"}`.
 
-Each chunk stored in pgvector carries a JSONB `metadata` object:
+### Webhook Notifications
+
+When a `webhook_url` is provided in the `POST /api/index` request body, the service sends a plain HTTP POST (no HMAC signing) to that URL on job completion:
 
 ```json
 {
-  "file_path": "src/auth/handler.go",
-  "language": "go",
-  "chunk_type": "function",
-  "symbol_type": "function",
-  "symbol_name": "AuthService.Login",
-  "function_name": "AuthService.Login",
-  "line_number": 42,
-  "signature": "func (s *AuthService) Login(ctx context.Context, creds Credentials) (*Token, error)",
-  "docstring": "Login authenticates a user and returns a JWT token.",
-  "params": ["ctx", "creds"],
-  "return_type": "",
-  "package": "auth",
-  "content": "... source text used for embedding ...",
-  "calls": ["AuthService.validateCredentials", "Token.Generate"],
-  "called_by": ["LoginHandler.ServeHTTP"],
-  "external_calls": ["log.Printf"],
-  "depends_on": ["src/auth/token.go"],
-  "imported_by": ["src/api/router.go"]
+  "job_id": "a3f9c1...",
+  "status": "complete",
+  "namespace": "acme",
+  "project_id": "my-service",
+  "total_vectors": 2841
 }
 ```
 
-## Technology Choices
+The webhook request has a 10-second timeout. Failures are silently ignored.
 
-| Component | Choice | Rationale |
-|-----------|--------|-----------|
-| **Language** | Python 3.10+ | Rich ML/embedding ecosystem, tree-sitter bindings, fast iteration |
-| **Web framework** | FastAPI | Async support, Pydantic validation, auto-generated docs |
-| **ASGI server** | Uvicorn | Production-grade async server for FastAPI |
-| **Database** | PostgreSQL + pgvector | Vector similarity search alongside relational data |
-| **ORM** | Raw psycopg2 | Direct control over queries, no abstraction overhead |
-| **Embeddings (local)** | microsoft/codebert-base | Good code understanding, no API needed, 768-d |
-| **Embeddings (cloud)** | Voyage AI voyage-code-3 | Superior code embeddings for large codebases, 1024-d |
-| **AST parsing** | tree-sitter + ast | Incremental, error-tolerant parsing for 12+ languages |
-| **Vector index** | IVFFlat (pgvector) | Good balance of index speed and recall |
-| **HTML UI** | Vanilla HTML/CSS/JS | Zero build step, single file, instant deployment |
+## Web UI
 
-## Multi-tenancy
-
-All data is scoped by `(namespace, project_id)`. This allows a single service
-instance to index and search across multiple organisations or repositories
-without data leakage. Queries always include both keys in the `WHERE` clause.
+`web/index.html` is a static single-page API documentation site. It is **not served by the Flask application** — it is a standalone HTML file that can be opened directly in a browser or deployed behind a static file server (nginx, S3, etc.). Note: the endpoint documentation in this HTML file describes a different API surface than what `main.py` implements; always refer to this `ARCHITECTURE.md` and the source code as the source of truth.
