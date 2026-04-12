@@ -88,7 +88,7 @@ def init_db() -> None:
                 )
                 """
             )
-            # Migration: add preferred_embedder column (idempotent)
+            # Per-tenant embedder override
             cur.execute(
                 "ALTER TABLE index_meta ADD COLUMN IF NOT EXISTS preferred_embedder TEXT"
             )
@@ -276,7 +276,7 @@ def upsert_index_meta(namespace: str, project_id: str, meta: Dict[str, Any]) -> 
                     model = EXCLUDED.model,
                     embedding_dim = EXCLUDED.embedding_dim,
                     use_cloud = EXCLUDED.use_cloud,
-                    preferred_embedder = COALESCE(EXCLUDED.preferred_embedder, index_meta.preferred_embedder),
+                    preferred_embedder = EXCLUDED.preferred_embedder,
                     updated_at = EXCLUDED.updated_at
                 RETURNING namespace, project_id, embedder, model,
                           embedding_dim, use_cloud, preferred_embedder,
@@ -296,26 +296,19 @@ def upsert_index_meta(namespace: str, project_id: str, meta: Dict[str, Any]) -> 
             )
             row = cur.fetchone()
             conn.commit()
-            return _row_to_index_meta(row)
+            return {
+                "namespace": row[0],
+                "project_id": row[1],
+                "embedder": row[2],
+                "model": row[3],
+                "embedding_dim": row[4],
+                "use_cloud": row[5],
+                "preferred_embedder": row[6],
+                "created_at": row[7].isoformat() + "Z" if isinstance(row[7], datetime) else row[7],
+                "updated_at": row[8].isoformat() + "Z" if isinstance(row[8], datetime) else row[8],
+            }
     finally:
         get_pool().putconn(conn)
-
-
-def _row_to_index_meta(row) -> Dict[str, Any]:
-    """Convert an index_meta result row to a dict."""
-    if not row:
-        return {}
-    return {
-        "namespace": row[0],
-        "project_id": row[1],
-        "embedder": row[2],
-        "model": row[3],
-        "embedding_dim": row[4],
-        "use_cloud": row[5],
-        "preferred_embedder": row[6] if len(row) > 6 else None,
-        "created_at": row[7].isoformat() + "Z" if isinstance(row[7], datetime) else row[7],
-        "updated_at": row[8].isoformat() + "Z" if isinstance(row[8], datetime) else row[8],
-    }
 
 
 def get_index_meta(namespace: str, project_id: str) -> Dict[str, Any]:
@@ -334,24 +327,26 @@ def get_index_meta(namespace: str, project_id: str) -> Dict[str, Any]:
             row = cur.fetchone()
             if not row:
                 return {}
-            return _row_to_index_meta(row)
+            return {
+                "namespace": row[0],
+                "project_id": row[1],
+                "embedder": row[2],
+                "model": row[3],
+                "embedding_dim": row[4],
+                "use_cloud": row[5],
+                "preferred_embedder": row[6],
+                "created_at": row[7].isoformat() + "Z" if isinstance(row[7], datetime) else row[7],
+                "updated_at": row[8].isoformat() + "Z" if isinstance(row[8], datetime) else row[8],
+            }
     finally:
         get_pool().putconn(conn)
 
 
-def update_tenant_embedder_config(
-    namespace: str,
-    project_id: str,
-    preferred_embedder: Optional[str],
-) -> Dict[str, Any]:
-    """Update (or clear) the preferred_embedder for a tenant project.
+def update_preferred_embedder(namespace: str, project_id: str, preferred_embedder: Optional[str]) -> Dict[str, Any]:
+    """Update only the preferred_embedder column for a tenant.
 
     If *preferred_embedder* is ``None`` the column is set to ``NULL``,
-    reverting to the size-based heuristic.
-
-    Returns the full index_meta row.  If no row exists yet one is
-    created with the preference so tenants can pre-configure before
-    their first indexing run.
+    reverting to automatic embedder selection.
     """
     now = datetime.utcnow().isoformat() + "Z"
     conn = get_pool().getconn()
@@ -367,15 +362,24 @@ def update_tenant_embedder_config(
                 DO UPDATE SET
                     preferred_embedder = EXCLUDED.preferred_embedder,
                     updated_at = EXCLUDED.updated_at
-                RETURNING namespace, project_id, embedder, model,
-                          embedding_dim, use_cloud, preferred_embedder,
-                          created_at, updated_at
+                RETURNING namespace, project_id, embedder, model, embedding_dim,
+                          use_cloud, preferred_embedder, created_at, updated_at
                 """,
                 (namespace, project_id, preferred_embedder, now, now),
             )
             row = cur.fetchone()
             conn.commit()
-            return _row_to_index_meta(row)
+            return {
+                "namespace": row[0],
+                "project_id": row[1],
+                "embedder": row[2],
+                "model": row[3],
+                "embedding_dim": row[4],
+                "use_cloud": row[5],
+                "preferred_embedder": row[6],
+                "created_at": row[7].isoformat() + "Z" if isinstance(row[7], datetime) else row[7],
+                "updated_at": row[8].isoformat() + "Z" if isinstance(row[8], datetime) else row[8],
+            }
     finally:
         get_pool().putconn(conn)
 
