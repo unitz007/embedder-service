@@ -13,3 +13,7 @@ venv
 /tmp
 *.zip
 *.log
+
+# Data & cache directories (generated at runtime — never ship)
+chroma_data/
+vector_store/
