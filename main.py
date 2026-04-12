@@ -247,10 +247,18 @@ def _run_index_job(
         tmp_dir = tempfile.mkdtemp(prefix="indexer_")
         _clone_repo(url, ref, tmp_dir)
 
-        # Determine preferred embedder
+        # Determine preferred embedder — request body overrides DB preference
         preferred_embedder = data.get("preferred_embedder")
         if preferred_embedder and not isinstance(preferred_embedder, str):
             preferred_embedder = None
+
+        if preferred_embedder is None:
+            # Fall back to the per-tenant DB preference so that a
+            # previously configured override is honoured on re-indexes
+            # triggered by webhooks or plain POST /api/index calls.
+            existing_meta = db.get_index_meta(namespace, project_id)
+            if existing_meta:
+                preferred_embedder = existing_meta.get("preferred_embedder")
 
         # Run the pgvector pipeline
         from indexing.full_pipeline import full_pipeline_pgvector
