@@ -2,7 +2,8 @@
 
 import ast
 import os
-from typing import List, Optional
+import re
+from typing import List, Optional, Tuple
 from models import FileAnalysis, FunctionInfo, ClassInfo, VariableInfo
 
 
@@ -201,6 +202,162 @@ def _extract_class_level_variables(class_node: ast.ClassDef, source_lines: List[
     return variables
 
 
+# ---------------------------------------------------------------------------
+# Regex-based fallback for files with SyntaxError
+# ---------------------------------------------------------------------------
+
+# Patterns for top-level definitions (only when not indented)
+_RE_DEF = re.compile(r'^(\s*)(async\s+)?def\s+(\w+)\s*\((.*)')
+_RE_CLASS = re.compile(r'^(\s*)class\s+(\w+)')
+_RE_IMPORT = re.compile(r'^(\s*)import\s+([\w.]+(?:\s*,\s*[\w.]+)*)')
+_RE_FROM_IMPORT = re.compile(r'^(\s*)from\s+([\w.]+)\s+import')
+_RE_TRIPLE_QUOTE_START = re.compile(r'^\s*("""|\'\'\')(.*?)("""|\'\'\')\s*$', re.DOTALL)
+_RE_TRIPLE_QUOTE_OPEN = re.compile(r'^\s*("""|\'\'\')(.*?)(?<!\\)$', re.DOTALL)
+
+
+def _try_extract_docstring(source_lines: List[str], start_idx: int) -> str:
+    """Attempt to extract a triple-quoted docstring starting at or near *start_idx*.
+
+    Looks at lines beginning from *start_idx* (0-based).  Skips blank lines
+    and lines that look like decorators.  Returns the docstring content
+    (without quotes) or an empty string if none is found within a small window.
+    """
+    for i in range(start_idx, min(start_idx + 3, len(source_lines))):
+        line = source_lines[i]
+        stripped = line.lstrip()
+
+        # Skip blank lines between the definition and potential docstring
+        if not stripped:
+            continue
+
+        # Skip decorator-like lines (shouldn't happen after def/class, but be safe)
+        if stripped.startswith('@'):
+            continue
+
+        # Single-line triple-quoted string: """docstring"""
+        m = _RE_TRIPLE_QUOTE_START.match(line)
+        if m:
+            return m.group(2).strip()
+
+        # Opening triple-quote (multi-line docstring)
+        m = _RE_TRIPLE_QUOTE_OPEN.match(line)
+        if m:
+            quote_char = m.group(1)
+            content = m.group(2)
+            # Look for closing quote on subsequent lines
+            close_pattern = re.compile(re.escape(quote_char) + r'\s*$')
+            for j in range(i + 1, min(i + 20, len(source_lines))):
+                if close_pattern.search(source_lines[j]):
+                    content += "\n" + source_lines[j][:source_lines[j].index(quote_char)] if quote_char in source_lines[j] else ""
+                    break
+                else:
+                    content += "\n" + source_lines[j]
+            return content.strip()
+
+        # Not a docstring at all — stop looking
+        break
+
+    return ""
+
+
+def _collect_signature_lines(source_lines: List[str], start_idx: int) -> str:
+    """Collect the definition signature starting from *start_idx* (0-based).
+
+    For multi-line signatures (e.g. with line continuations or open parens),
+    we keep consuming lines until we find one ending with ``:``.
+    """
+    parts: List[str] = []
+    for i in range(start_idx, min(start_idx + 10, len(source_lines))):
+        parts.append(source_lines[i].rstrip())
+        if source_lines[i].rstrip().endswith(":"):
+            break
+    return " ".join(l.strip() for l in parts).rstrip(":")
+
+
+def _regex_fallback(source: str, file_path: str, source_lines: List[str]) -> FileAnalysis:
+    """Best-effort extraction of top-level definitions using regex.
+
+    This is invoked when ``ast.parse()`` fails with a :class:`SyntaxError`.
+    It recovers ``def``/``async def``/``class`` definitions, and
+    ``import``/``from ... import`` statements so that a file with a single
+    syntax error on line 200 does not lose all symbols from lines 1-199.
+    """
+    functions: List[FunctionInfo] = []
+    classes: List[ClassInfo] = []
+    imports: List[str] = []
+
+    for idx, line in enumerate(source_lines):
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+
+        # Only consider top-level (or very shallow) definitions.
+        # We use indent == 0 to match truly top-level items.
+        if indent != 0:
+            continue
+
+        # --- def / async def ---
+        m = _RE_DEF.match(line)
+        if m:
+            is_async = m.group(2) is not None
+            name = m.group(3)
+            signature = _collect_signature_lines(source_lines, idx)
+            if is_async:
+                signature = signature.replace("async def", "async def", 1)  # ensure "async" prefix kept
+            docstring = _try_extract_docstring(source_lines, idx + 1)
+            functions.append(FunctionInfo(
+                name=name,
+                line=idx + 1,  # 1-based
+                signature=signature,
+                docstring=docstring,
+                params=[],
+                return_type="",
+                decorators=[],
+            ))
+            continue
+
+        # --- class ---
+        m = _RE_CLASS.match(line)
+        if m:
+            name = m.group(2)
+            signature = _collect_signature_lines(source_lines, idx)
+            docstring = _try_extract_docstring(source_lines, idx + 1)
+            classes.append(ClassInfo(
+                name=name,
+                line=idx + 1,
+                docstring=docstring,
+                kind="class",
+            ))
+            continue
+
+        # --- import X [, Y, ...] ---
+        m = _RE_IMPORT.match(line)
+        if m:
+            modules_str = m.group(2)
+            for mod in modules_str.split(","):
+                mod = mod.strip()
+                if mod:
+                    imports.append(mod)
+            continue
+
+        # --- from X import ... ---
+        m = _RE_FROM_IMPORT.match(line)
+        if m:
+            module = m.group(2)
+            if module:
+                imports.append(module)
+            continue
+
+    return FileAnalysis(
+        file_path=file_path,
+        language="python",
+        functions=functions,
+        classes=classes,
+        imports=imports,
+        package=_get_package(file_path),
+        variables=[],
+    )
+
+
 def analyze_python(file_path):
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         source = f.read()
@@ -210,14 +367,7 @@ def analyze_python(file_path):
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return FileAnalysis(
-            file_path=file_path,
-            language="python",
-            functions=[],
-            classes=[],
-            imports=[],
-            variables=[],
-        )
+        return _regex_fallback(source, file_path, source_lines)
 
     functions: List[FunctionInfo] = []
     classes: List[ClassInfo] = []

@@ -525,14 +525,82 @@ def test_chunker_no_variables_no_var_section():
 # ---------------------------------------------------------------------------
 
 def test_python_syntax_error():
-    """A file with invalid Python should not crash; returns empty analysis."""
+    """A file with invalid Python triggers the regex fallback and recovers symbols."""
     fd, path = tempfile.mkstemp(suffix=".py")
     with os.fdopen(fd, "w") as f:
-        f.write("def broken(\n")  # incomplete function
+        f.write("""\
+import os
+import sys
+from collections import OrderedDict
+
+def hello(name):
+    '''Say hello.'''
+    print(name)
+
+class MyClass:
+    '''A test class.'''
+
+def broken(
+""")  # SyntaxError: missing closing paren
     try:
         result = analyze_python(path)
         assert isinstance(result, FileAnalysis)
         assert result.language == "python"
+
+        # The regex fallback should have recovered the definitions above the error
+        assert len(result.functions) >= 1
+        assert len(result.imports) >= 1
+        assert len(result.classes) >= 1
+
+        # Check specific recovered symbols
+        fn_names = [f.name for f in result.functions]
+        assert "hello" in fn_names
+        hello_fn = next(f for f in result.functions if f.name == "hello")
+        assert hello_fn.line == 5
+        assert "hello" in hello_fn.name
+        assert hello_fn.signature != ""
+
+        class_names = [c.name for c in result.classes]
+        assert "MyClass" in class_names
+        myclass = next(c for c in result.classes if c.name == "MyClass")
+        assert "test class" in myclass.docstring
+
+        # Imports recovered
+        assert "os" in result.imports
+        assert "sys" in result.imports
+        assert "collections" in result.imports
+
+        # No variables in fallback (regex fallback doesn't extract variables)
+        assert result.variables == []
+    finally:
+        os.unlink(path)
+
+
+def test_python_syntax_error_incomplete_def():
+    """Minimal incomplete function def still returns a non-empty FileAnalysis."""
+    fd, path = tempfile.mkstemp(suffix=".py")
+    with os.fdopen(fd, "w") as f:
+        f.write("def broken(\n")  # incomplete function — SyntaxError
+    try:
+        result = analyze_python(path)
+        assert isinstance(result, FileAnalysis)
+        assert result.language == "python"
+        # The regex fallback should detect "def broken(" even though it's invalid
+        # and return it as a best-effort function entry.
+        assert len(result.functions) >= 1
+        assert result.functions[0].name == "broken"
+    finally:
+        os.unlink(path)
+
+
+def test_python_syntax_error_empty_file():
+    """An empty file has no syntax error and should return empty analysis."""
+    fd, path = tempfile.mkstemp(suffix=".py")
+    with os.fdopen(fd, "w") as f:
+        f.write("")
+    try:
+        result = analyze_python(path)
+        assert isinstance(result, FileAnalysis)
         assert result.functions == []
         assert result.classes == []
         assert result.variables == []
@@ -540,15 +608,71 @@ def test_python_syntax_error():
         os.unlink(path)
 
 
-def test_python_empty_file():
+def test_python_syntax_error_async_def():
+    """Regex fallback recovers async def definitions."""
     fd, path = tempfile.mkstemp(suffix=".py")
     with os.fdopen(fd, "w") as f:
-        f.write("")
+        f.write("""\
+import asyncio
+
+async def fetch_data(url: str) -> bytes:
+    '''Fetch data from URL.'''
+    pass
+
+def broken(
+""")  # SyntaxError on last line
     try:
         result = analyze_python(path)
-        assert result.functions == []
-        assert result.classes == []
-        assert result.variables == []
+        fn_names = [f.name for f in result.functions]
+        assert "fetch_data" in fn_names
+        assert "asyncio" in result.imports
+    finally:
+        os.unlink(path)
+
+
+def test_python_syntax_error_import_recovery():
+    """Regex fallback recovers both 'import X' and 'from X import Y' statements."""
+    fd, path = tempfile.mkstemp(suffix="..py")
+    with os.fdopen(fd, "w") as f:
+        f.write("""\
+import os
+import sys, json
+from pathlib import Path
+from typing import List, Dict
+from collections import OrderedDict
+
+def broken(
+""")  # SyntaxError
+    try:
+        result = analyze_python(path)
+        assert "os" in result.imports
+        assert "sys" in result.imports
+        assert "json" in result.imports
+        assert "pathlib" in result.imports
+        assert "typing" in result.imports
+        assert "collections" in result.imports
+    finally:
+        os.unlink(path)
+
+
+def test_python_syntax_error_multiline_docstring():
+    """Regex fallback recovers multi-line triple-quoted docstrings."""
+    fd, path = tempfile.mkstemp(suffix=".py")
+    with os.fdopen(fd, "w") as f:
+        f.write('''\
+class Service:
+    """A service that does things.
+
+    It has multiple lines in its docstring.
+    """
+
+def broken(
+''')  # SyntaxError
+    try:
+        result = analyze_python(path)
+        service_cls = next(c for c in result.classes if c.name == "Service")
+        assert "A service that does things" in service_cls.docstring
+        assert "multiple lines" in service_cls.docstring
     finally:
         os.unlink(path)
 
