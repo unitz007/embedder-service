@@ -127,7 +127,7 @@ def chunk_file_analysis(analysis: FileAnalysis) -> List[Dict[str, Any]]:
     Reads file content exactly once. Stores:
       - content: source text used for embedding
       - metadata: structured fields including signature, docstring, params,
-                  return_type used for LLM context injection and BM25 scoring
+                  return_type, decorators used for LLM context injection and BM25 scoring
     """
     chunks = []
 
@@ -171,6 +171,7 @@ def chunk_file_analysis(analysis: FileAnalysis) -> List[Dict[str, Any]]:
                 "docstring": func.docstring,
                 "params": func.params,
                 "return_type": func.return_type,
+                "decorators": func.decorators,
                 "package": analysis.package,
                 "content": func_body,
             },

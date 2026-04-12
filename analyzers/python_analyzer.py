@@ -27,6 +27,24 @@ def _get_return_annotation(node) -> str:
         return ""
 
 
+def _get_decorators(node) -> List[str]:
+    """Extract decorator strings from a function/method node.
+
+    Iterates over ``node.decorator_list`` and unparses each decorator AST
+    node into its source representation (e.g. ``@staticmethod``,
+    ``@app.route("/health")``).  The order matches source appearance
+    (top-to-bottom), which is the order in ``decorator_list``.
+    """
+    decorators: List[str] = []
+    for dec in node.decorator_list:
+        try:
+            decorators.append("@" + ast.unparse(dec))
+        except Exception:
+            # Fallback: skip decorators that cannot be unparsed
+            continue
+    return decorators
+
+
 def _process_function(
     node, source_lines: List[str], class_name: str = ""
 ) -> FunctionInfo:
@@ -34,6 +52,7 @@ def _process_function(
     docstring = ast.get_docstring(node) or ""
     params = [arg.arg for arg in node.args.args]
     return_type = _get_return_annotation(node)
+    decorators = _get_decorators(node)
     full_name = f"{class_name}.{node.name}" if class_name else node.name
     return FunctionInfo(
         name=full_name,
@@ -42,6 +61,7 @@ def _process_function(
         docstring=docstring,
         params=params,
         return_type=return_type,
+        decorators=decorators,
     )
 
 
