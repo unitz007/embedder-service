@@ -12,6 +12,7 @@ class FunctionInfo:
     docstring: str = ""         # Doc comment or Python docstring
     params: List[str] = field(default_factory=list)
     return_type: str = ""
+    decorators: List[str] = field(default_factory=list)
 
 
 @dataclass
