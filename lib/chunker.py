@@ -122,12 +122,12 @@ def extract_class_body(lines: List[str], start_line: int, language: str, context
 
 def chunk_file_analysis(analysis: FileAnalysis) -> List[Dict[str, Any]]:
     """
-    Break a FileAnalysis into chunks based on functions, classes, imports, and variables.
+    Break a FileAnalysis into chunks based on functions, classes, and imports.
 
     Reads file content exactly once. Stores:
       - content: source text used for embedding
       - metadata: structured fields including signature, docstring, params,
-                  return_type used for LLM context injection and BM25 scoring
+                  return_type, decorators used for LLM context injection and BM25 scoring
     """
     chunks = []
 
@@ -171,6 +171,7 @@ def chunk_file_analysis(analysis: FileAnalysis) -> List[Dict[str, Any]]:
                 "docstring": func.docstring,
                 "params": func.params,
                 "return_type": func.return_type,
+                "decorators": func.decorators,
                 "package": analysis.package,
                 "content": func_body,
             },
@@ -192,39 +193,9 @@ def chunk_file_analysis(analysis: FileAnalysis) -> List[Dict[str, Any]]:
                 "symbol_name": cls.name,
                 "docstring": cls.docstring,
                 "package": analysis.package,
-                "fields": [{"name": f.name, "type_str": f.type_str, "tag": f.tag} for f in cls.fields],
                 "content": class_body,
             },
         })
-
-    # --- Variable chunks ---
-    if analysis.variables:
-        for var in analysis.variables:
-            # Extract a few lines of context around the variable declaration
-            start_idx = max(0, var.line - 1)
-            context_before = max(0, start_idx - 3)
-            context_after = min(len(file_lines), start_idx + 6)
-            var_body = "".join(file_lines[context_before:context_after]).rstrip() + "\n"
-
-            chunks.append({
-                "content": var_body,
-                "type": "variable",
-                "metadata": {
-                    "file_path": analysis.file_path,
-                    "language": analysis.language,
-                    "variable_name": var.name,
-                    "line_number": var.line,
-                    "chunk_type": "variable",
-                    "symbol_type": var.kind or "var",
-                    "symbol_name": var.name,
-                    "kind": var.kind,
-                    "value": var.value,
-                    "type_annotation": var.type_annotation,
-                    "docstring": var.docstring,
-                    "package": analysis.package,
-                    "content": var_body,
-                },
-            })
 
     # --- File-level summary chunk ---
     # Always add a compact file-level chunk so the LLM can find a file by its
@@ -236,8 +207,6 @@ def chunk_file_analysis(analysis: FileAnalysis) -> List[Dict[str, Any]]:
         summary_parts.append("Functions: " + ", ".join(f.name for f in analysis.functions[:20]))
     if analysis.classes:
         summary_parts.append("Types: " + ", ".join(c.name for c in analysis.classes[:20]))
-    if analysis.variables:
-        summary_parts.append("Variables: " + ", ".join(v.name for v in analysis.variables[:20]))
     if analysis.imports:
         summary_parts.append("Imports: " + ", ".join(analysis.imports[:15]))
     summary_content = "\n".join(summary_parts)
@@ -254,7 +223,6 @@ def chunk_file_analysis(analysis: FileAnalysis) -> List[Dict[str, Any]]:
             "package": analysis.package,
             "function_count": len(analysis.functions),
             "class_count": len(analysis.classes),
-            "variable_count": len(analysis.variables),
             "content": summary_content,
         },
     })
