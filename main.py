@@ -31,11 +31,10 @@ VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
 # Reuse a single local embedder instance to avoid reload per request
 EMBEDDER = CodeEmbedder(DEFAULT_MODEL)
 
-# Maximum text length accepted by the /embed endpoint.
-# Most embedding models have token limits (~32k tokens ≈ ~120k chars for code).
-# We cap at a conservative 100 000 characters to prevent abuse and avoid
-# silent truncation errors in downstream models.
-_EMBED_MAX_TEXT_LENGTH = 100_000
+# Maximum allowed text length for the /embed endpoint (characters).
+# Sentence-transformers truncates to 512 tokens; Voyage AI has a ~32K token limit.
+# 50 000 characters is a safe upper bound for both.
+MAX_EMBED_TEXT_LENGTH = 50000
 
 
 @app.on_event("startup")
@@ -68,7 +67,10 @@ class TextSearchRequest(BaseModel):
 
 
 class EmbedRequest(BaseModel):
-    text: str = Field(..., description="Text to embed using the indexing model")
+    text: str = Field(
+        ...,
+        description=f"Text to embed using the indexing model (max {MAX_EMBED_TEXT_LENGTH} characters)",
+    )
     use_cloud: bool = Field(
         False,
         description=(
@@ -108,6 +110,7 @@ def _require_bearer_token(request: Request) -> str:
 def _read_index_meta(namespace: str, project_id: str) -> dict:
     """Return index metadata from the database, or {} if missing."""
     return db.get_index_meta(namespace, project_id) or {}
+
 
 def _job_update(job_id, **updates):
     updates["updated_at"] = datetime.utcnow().isoformat() + "Z"
@@ -282,7 +285,7 @@ def get_job(job_id: str, request: Request):
     _require_bearer_token(request)
     job = db.get_job(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="job not found")
+        return {"error": "job not found"}
     return job
 
 
@@ -401,10 +404,11 @@ def embed_text(req: EmbedRequest):
     if not req.text.strip():
         return {"error": "text is empty"}
 
-    if len(req.text) > _EMBED_MAX_TEXT_LENGTH:
+    if len(req.text) > MAX_EMBED_TEXT_LENGTH:
         raise HTTPException(
             status_code=413,
-            detail=f"text exceeds maximum length of {_EMBED_MAX_TEXT_LENGTH} characters (got {len(req.text)})",
+            detail=f"Text exceeds maximum allowed length of {MAX_EMBED_TEXT_LENGTH} characters "
+                   f"(got {len(req.text)} characters).",
         )
 
     # Auto-detect the right model from the project's index metadata so the
