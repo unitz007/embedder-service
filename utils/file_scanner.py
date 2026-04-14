@@ -16,7 +16,7 @@ IGNORE_DIRS = {
     # Rust
     "target",
     # IDE / tooling
-    ".idea", ".vscode", ".DS_Store",
+    ".idea", ".DS_Store",
     # Build outputs
     "out", "bin", "obj", ".cache", ".tmp", "tmp",
     # Test coverage
@@ -24,6 +24,9 @@ IGNORE_DIRS = {
     # Generated / infra
     "migrations",
 }
+
+# Dot-directories that are always indexed, even when include_dotfiles=False.
+DOTDIR_ALLOWLIST = {".github", ".vscode"}
 
 # Skip files whose names contain these suffixes (generated or minified)
 IGNORE_FILE_SUFFIXES = (
@@ -33,7 +36,7 @@ IGNORE_FILE_SUFFIXES = (
     ".g.dart",               # generated Flutter
 )
 
-BINARY_EXTENSIONS = {
+BINARY_EXTENSIONS = frozenset({
     # Images
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".ico", ".webp",
     # Documents / archives
@@ -48,58 +51,110 @@ BINARY_EXTENSIONS = {
     ".lock",
     # Misc
     ".pkl", ".bin", ".dat",
-}
+    # WebAssembly
+    ".wasm",
+})
 
-MAX_FILE_SIZE_BYTES = 512 * 1024  # Skip files larger than 512 KB
+GENERATED_FILE_PATTERNS = (
+    # Lock files
+    "package-lock.json",
+    "yarn.lock",
+    "Pipfile.lock",
+    "poetry.lock",
+    "Cargo.lock",
+    "go.sum",
+    "composer.lock",
+    # Compiled outputs
+    ".pyc",
+    # Minified bundles
+    ".min.js",
+    ".min.css",
+    # Protobuf generated
+    ".pb.go",
+    ".pb.rs",
+    # Generic generated
+    ".generated.",
+)
+
+MAX_FILE_SIZE_BYTES = 1_000_000  # Skip files larger than 1 MB
 
 
 def scan_repository(repo_path: str, include_dotfiles: bool = False):
     """
-    Walk `repo_path` and return a list of source file paths to index.
+    Walk ``repo_path`` and return a list of **relative** source file paths.
+
+    Filters out binary files, generated/lock files, oversized files,
+    and (optionally) dotfiles.  Directories in ``DOTDIR_ALLOWLIST``
+    (e.g. ``.github/``, ``.vscode/``) are always indexed regardless of
+    the *include_dotfiles* flag.
 
     Args:
         repo_path:        Root directory to scan.
-        include_dotfiles: When True, include hidden files and directories
-                          (those starting with '.'), except for .git and
-                          other VCS directories.  Enable this when indexing
-                          dotfile repositories like ~/.dotfiles.
+        include_dotfiles: When ``True``, include all hidden files and
+                          directories (except VCS/build dirs in
+                          ``IGNORE_DIRS``).  When ``False`` (default),
+                          only ``DOTDIR_ALLOWLIST`` dot-dirs are kept.
+
+    Returns:
+        List of file paths **relative** to *repo_path*.
     """
+    repo = os.path.abspath(repo_path)
     files = []
 
-    for root, dirs, filenames in os.walk(repo_path):
-        if include_dotfiles:
-            # Allow hidden dirs, but always prune VCS and known build dirs
-            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
-        else:
-            # Default: prune hidden dirs AND known ignore dirs
-            dirs[:] = [
-                d for d in dirs
-                if d not in IGNORE_DIRS and not d.startswith(".")
-            ]
+    for root, dirs, filenames in os.walk(repo):
+        # Build list of dirs to descend into.
+        kept: list[str] = []
+        for d in dirs:
+            if d in IGNORE_DIRS:
+                continue
+            if not include_dotfiles and d.startswith(".") and d not in DOTDIR_ALLOWLIST:
+                continue
+            kept.append(d)
+        dirs[:] = kept
 
         for filename in filenames:
-            # In normal mode, skip hidden files
+            # In normal mode, skip hidden files unless parent dir is in allowlist.
             if not include_dotfiles and filename.startswith("."):
-                continue
+                # Still include dotfiles if the current dir is in DOTDIR_ALLOWLIST.
+                dir_name = os.path.basename(root)
+                if dir_name not in DOTDIR_ALLOWLIST:
+                    continue
 
-            # Skip by extension
+            # Skip by extension (binary files)
             _, ext = os.path.splitext(filename)
             if ext.lower() in BINARY_EXTENSIONS:
                 continue
 
-            # Skip generated / minified files
+            # Skip generated / minified files by suffix
             if any(filename.endswith(suffix) for suffix in IGNORE_FILE_SUFFIXES):
                 continue
 
-            path = os.path.join(root, filename)
+            # Skip generated / lock files by exact name or pattern
+            if _is_generated_file(filename):
+                continue
+
+            abs_path = os.path.join(root, filename)
 
             # Skip oversized files
             try:
-                if os.path.getsize(path) > MAX_FILE_SIZE_BYTES:
+                if os.path.getsize(abs_path) > MAX_FILE_SIZE_BYTES:
                     continue
             except OSError:
                 continue
 
-            files.append(path)
+            # Return path relative to repo_path
+            files.append(os.path.relpath(abs_path, repo))
 
     return files
+
+
+def _is_generated_file(filename: str) -> bool:
+    """Return True if *filename* matches a known generated-file pattern."""
+    for pattern in GENERATED_FILE_PATTERNS:
+        if pattern.startswith(".") and pattern.endswith("."):
+            # Pattern like ".generated." — match anywhere in filename
+            if pattern.strip(".") in filename:
+                return True
+        elif filename == pattern or filename.endswith(pattern):
+            return True
+    return False
