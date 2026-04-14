@@ -33,7 +33,7 @@ IGNORE_FILE_SUFFIXES = (
     ".g.dart",               # generated Flutter
 )
 
-BINARY_EXTENSIONS = {
+BINARY_EXTENSIONS = frozenset({
     # Images
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".ico", ".webp",
     # Documents / archives
@@ -48,14 +48,40 @@ BINARY_EXTENSIONS = {
     ".lock",
     # Misc
     ".pkl", ".bin", ".dat",
-}
+    # WebAssembly
+    ".wasm",
+})
 
-MAX_FILE_SIZE_BYTES = 512 * 1024  # Skip files larger than 512 KB
+GENERATED_FILE_PATTERNS = (
+    # Lock files
+    "package-lock.json",
+    "yarn.lock",
+    "Pipfile.lock",
+    "poetry.lock",
+    "Cargo.lock",
+    "go.sum",
+    "composer.lock",
+    # Compiled outputs
+    ".pyc",
+    # Minified bundles
+    ".min.js",
+    ".min.css",
+    # Protobuf generated
+    ".pb.go",
+    ".pb.rs",
+    # Generic generated
+    ".generated.",
+)
+
+MAX_FILE_SIZE_BYTES = 1_000_000  # Skip files larger than 1 MB
 
 
 def scan_repository(repo_path: str, include_dotfiles: bool = False):
     """
     Walk `repo_path` and return a list of source file paths to index.
+
+    Filters out binary files, generated/lock files, oversized files,
+    and (optionally) dotfiles.
 
     Args:
         repo_path:        Root directory to scan.
@@ -63,6 +89,9 @@ def scan_repository(repo_path: str, include_dotfiles: bool = False):
                           (those starting with '.'), except for .git and
                           other VCS directories.  Enable this when indexing
                           dotfile repositories like ~/.dotfiles.
+
+    Returns:
+        List of absolute file paths that passed all filters.
     """
     files = []
 
@@ -82,13 +111,17 @@ def scan_repository(repo_path: str, include_dotfiles: bool = False):
             if not include_dotfiles and filename.startswith("."):
                 continue
 
-            # Skip by extension
+            # Skip by extension (binary files)
             _, ext = os.path.splitext(filename)
             if ext.lower() in BINARY_EXTENSIONS:
                 continue
 
-            # Skip generated / minified files
+            # Skip generated / minified files by suffix
             if any(filename.endswith(suffix) for suffix in IGNORE_FILE_SUFFIXES):
+                continue
+
+            # Skip generated / lock files by exact name or pattern
+            if _is_generated_file(filename):
                 continue
 
             path = os.path.join(root, filename)
@@ -103,3 +136,15 @@ def scan_repository(repo_path: str, include_dotfiles: bool = False):
             files.append(path)
 
     return files
+
+
+def _is_generated_file(filename: str) -> bool:
+    """Return True if *filename* matches a known generated-file pattern."""
+    for pattern in GENERATED_FILE_PATTERNS:
+        if pattern.startswith(".") and pattern.endswith("."):
+            # Pattern like ".generated." — match anywhere in filename
+            if pattern.strip(".") in filename:
+                return True
+        elif filename == pattern or filename.endswith(pattern):
+            return True
+    return False

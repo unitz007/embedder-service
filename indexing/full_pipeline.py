@@ -7,6 +7,7 @@ Embedding Generation -> Chroma Vector DB -> ContextBuilder (LLM-ready)
 """
 
 import json
+import os
 import pickle
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -28,12 +29,14 @@ from lib.graph import (
 )
 from utils.file_scanner import scan_repository
 from utils.language_router import analyze_file
+from utils.file_hashes import get_changed_files, load_hashes
 from store.pgvector_store import PgVectorStore
 
 
 def index_repository(
     repo_path: str,
     include_dotfiles: bool = False,
+    cache_path: Optional[str] = None,
 ) -> List[Any]:
     """
     Steps 1-5: Repository -> File Discovery -> Language Detection -> AST Parsing -> Symbol Extraction
@@ -42,6 +45,10 @@ def index_repository(
         repo_path:        Root directory to scan.
         include_dotfiles: Pass True when indexing dotfile repos (e.g. ~/.dotfiles)
                           so hidden files like .zshrc, .gitconfig are included.
+        cache_path:       Optional path to a file-hash JSON cache. When provided,
+                          only files whose content has changed since the last run
+                          are passed to ``analyze_file()``. This avoids redundant
+                          AST parsing and embedding generation for unchanged files.
 
     Returns:
         List of FileAnalysis objects.
@@ -49,16 +56,39 @@ def index_repository(
     print("Step 1-5: Scanning repository and extracting symbols...")
     files = scan_repository(repo_path, include_dotfiles=include_dotfiles)
 
+    # When a cache is provided, use incremental indexing.
+    if cache_path is not None:
+        repo = Path(repo_path)
+        all_files = [os.path.relpath(f, repo_path) for f in files]
+
+        # Snapshot old cache keys before get_changed_files overwrites them
+        old_cache_keys = set(load_hashes(cache_path).keys())
+
+        changed, unchanged = get_changed_files(repo_path, all_files, cache_path)
+
+        # Map changed relative paths back to absolute paths
+        changed_abs = [str(repo / f) for f in changed]
+
+        num_removed = len(old_cache_keys - set(all_files))
+        num_new = sum(1 for f in changed if f not in old_cache_keys)
+
+        print(
+            f"Incremental indexing: "
+            f"{len(unchanged)} files unchanged (skipped), "
+            f"{len(changed)} files changed "
+            f"({num_new} new, {len(changed) - num_new} modified), "
+            f"{num_removed} files removed"
+        )
+
+        files = changed_abs
+
     results = []
     for file in files:
         analysis = analyze_file(file)
         if analysis:
             results.append(analysis)
 
-    # skipped = len(files) - len(results)
-
     return results
-
 
 
 def chunk_analyses(analyses: List[Any]) -> List[Dict[str, Any]]:
