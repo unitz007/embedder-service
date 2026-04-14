@@ -54,22 +54,20 @@ def index_repository(
         List of FileAnalysis objects.
     """
     print("Step 1-5: Scanning repository and extracting symbols...")
+    # scan_repository returns paths relative to repo_path
     files = scan_repository(repo_path, include_dotfiles=include_dotfiles)
 
     # When a cache is provided, use incremental indexing.
     if cache_path is not None:
-        repo = Path(repo_path)
-        all_files = [os.path.relpath(f, repo_path) for f in files]
-
         # Snapshot old cache keys before get_changed_files overwrites them
         old_cache_keys = set(load_hashes(cache_path).keys())
 
-        changed, unchanged = get_changed_files(repo_path, all_files, cache_path)
+        changed, unchanged = get_changed_files(repo_path, files, cache_path)
 
-        # Map changed relative paths back to absolute paths
-        changed_abs = [str(repo / f) for f in changed]
+        # Map changed relative paths back to absolute paths for analyze_file()
+        changed_abs = [os.path.join(repo_path, f) for f in changed]
 
-        num_removed = len(old_cache_keys - set(all_files))
+        num_removed = len(old_cache_keys - set(files))
         num_new = sum(1 for f in changed if f not in old_cache_keys)
 
         print(
@@ -81,6 +79,9 @@ def index_repository(
         )
 
         files = changed_abs
+    else:
+        # No cache — convert relative paths to absolute for analyze_file()
+        files = [os.path.join(repo_path, f) for f in files]
 
     results = []
     for file in files:

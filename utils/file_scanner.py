@@ -16,7 +16,7 @@ IGNORE_DIRS = {
     # Rust
     "target",
     # IDE / tooling
-    ".idea", ".vscode", ".DS_Store",
+    ".idea", ".DS_Store",
     # Build outputs
     "out", "bin", "obj", ".cache", ".tmp", "tmp",
     # Test coverage
@@ -24,6 +24,9 @@ IGNORE_DIRS = {
     # Generated / infra
     "migrations",
 }
+
+# Dot-directories that are always indexed, even when include_dotfiles=False.
+DOTDIR_ALLOWLIST = {".github", ".vscode"}
 
 # Skip files whose names contain these suffixes (generated or minified)
 IGNORE_FILE_SUFFIXES = (
@@ -78,38 +81,44 @@ MAX_FILE_SIZE_BYTES = 1_000_000  # Skip files larger than 1 MB
 
 def scan_repository(repo_path: str, include_dotfiles: bool = False):
     """
-    Walk `repo_path` and return a list of source file paths to index.
+    Walk ``repo_path`` and return a list of **relative** source file paths.
 
     Filters out binary files, generated/lock files, oversized files,
-    and (optionally) dotfiles.
+    and (optionally) dotfiles.  Directories in ``DOTDIR_ALLOWLIST``
+    (e.g. ``.github/``, ``.vscode/``) are always indexed regardless of
+    the *include_dotfiles* flag.
 
     Args:
         repo_path:        Root directory to scan.
-        include_dotfiles: When True, include hidden files and directories
-                          (those starting with '.'), except for .git and
-                          other VCS directories.  Enable this when indexing
-                          dotfile repositories like ~/.dotfiles.
+        include_dotfiles: When ``True``, include all hidden files and
+                          directories (except VCS/build dirs in
+                          ``IGNORE_DIRS``).  When ``False`` (default),
+                          only ``DOTDIR_ALLOWLIST`` dot-dirs are kept.
 
     Returns:
-        List of absolute file paths that passed all filters.
+        List of file paths **relative** to *repo_path*.
     """
+    repo = os.path.abspath(repo_path)
     files = []
 
-    for root, dirs, filenames in os.walk(repo_path):
-        if include_dotfiles:
-            # Allow hidden dirs, but always prune VCS and known build dirs
-            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
-        else:
-            # Default: prune hidden dirs AND known ignore dirs
-            dirs[:] = [
-                d for d in dirs
-                if d not in IGNORE_DIRS and not d.startswith(".")
-            ]
+    for root, dirs, filenames in os.walk(repo):
+        # Build list of dirs to descend into.
+        kept: list[str] = []
+        for d in dirs:
+            if d in IGNORE_DIRS:
+                continue
+            if not include_dotfiles and d.startswith(".") and d not in DOTDIR_ALLOWLIST:
+                continue
+            kept.append(d)
+        dirs[:] = kept
 
         for filename in filenames:
-            # In normal mode, skip hidden files
+            # In normal mode, skip hidden files unless parent dir is in allowlist.
             if not include_dotfiles and filename.startswith("."):
-                continue
+                # Still include dotfiles if the current dir is in DOTDIR_ALLOWLIST.
+                dir_name = os.path.basename(root)
+                if dir_name not in DOTDIR_ALLOWLIST:
+                    continue
 
             # Skip by extension (binary files)
             _, ext = os.path.splitext(filename)
@@ -124,16 +133,17 @@ def scan_repository(repo_path: str, include_dotfiles: bool = False):
             if _is_generated_file(filename):
                 continue
 
-            path = os.path.join(root, filename)
+            abs_path = os.path.join(root, filename)
 
             # Skip oversized files
             try:
-                if os.path.getsize(path) > MAX_FILE_SIZE_BYTES:
+                if os.path.getsize(abs_path) > MAX_FILE_SIZE_BYTES:
                     continue
             except OSError:
                 continue
 
-            files.append(path)
+            # Return path relative to repo_path
+            files.append(os.path.relpath(abs_path, repo))
 
     return files
 
