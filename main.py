@@ -43,7 +43,7 @@ MAX_EMBED_TEXT_LENGTH = 50000
 
 
 
-def _startup():
+:
     db.init_db()
 
 

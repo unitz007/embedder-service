@@ -8,7 +8,19 @@ from psycopg2.pool import ThreadedConnectionPool
 _POOL: Optional[ThreadedConnectionPool] = None
 
 
-def _normalize_db_url(url: str, app_env: str) -> str:
+def """
+        Apply DB connection options for non‑production environments.
+        """
+        if app_env != "prod":
+            return url
+\n                if app_env == "prod":
+            return _normalize_db_url(url, app_env)
+        return url
+
+            return _normalize_db_url(url, app_env)
+        if app_env != "prod":
+            return url
+(url: str, app_env: str) -> str:
     if app_env != "prod":
         return url
     if "sslmode=" in url:
@@ -33,7 +45,50 @@ def get_database_url() -> str:
     return "postgresql://postgres:postgres@localhost:5432/indexer"
 
 
-def get_pool() -> ThreadedConnectionPool:
+    _POOL = ThreadedConnectionPool(
+        minconn=2,
+        maxconn=maxconn,
+        dsn=get_database_url(),
+        connect_timeout=10,
+        options='-c statement_timeout=30000',
+    )
+    _POOL = ThreadedConnectionPool(
+        minconn=2,
+        maxconn=maxconn,
+        dsn=get_database_url(),
+        connect_timeout=10,
+        options='-c statement_timeout=30000',
+    )
+
+
+
+    global _POOL
+    if _POOL is not None:
+        _POOL.closeall()
+        _POOL = None
+ -> None:
+    """Gracefully close and drain the connection pool.
+
+    Closes all connections and clears the global pool reference.  Safe to call
+    multiple times; idempotent."""
+    global _POOL
+    if _POOL is not None:
+        _POOL.closeall()
+        _POOL = None
+ -> ThreadedConnectionPool:
+    global _POOL
+    if _POOL is not None:
+        return _POOL
+    maxconn = int(os.getenv("DB_POOL_MAX", "20"))
+    _POOL = ThreadedConnectionPool(
+        minconn=2,
+        maxconn=maxconn,
+        dsn=get_database_url(),
+        connect_timeout=10,
+        options='-c statement_timeout=30000',
+    )
+    return _POOL
+
 
 def close_pool() -> None:
     """Gracefully close and drop the connection pool.
@@ -45,17 +100,6 @@ def close_pool() -> None:
     if _POOL is not None:
         _POOL.closeall()
         _POOL = None
-    global _POOL
-    if _POOL is None:
-        maxconn = int(os.getenv("DB_POOL_MAX", "20"))
-        _POOL = ThreadedConnectionPool(
-            minconn=2,
-            maxconn=maxconn,
-            dsn=get_database_url(),
-            connect_timeout=10,
-            options='-c statement_timeout=30000',
-        )
-    return _POOL
 
 
 def init_db() -> None:
@@ -145,283 +189,4 @@ def init_db() -> None:
     finally:
         get_pool().putconn(conn)
 
-
-def _row_to_job(row) -> Dict[str, Any]:
-    if not row:
-        return {}
-    keys = [
-        "job_id",
-        "namespace",
-        "project_id",
-        "filename",
-        "status",
-        "source",
-        "owner",
-        "repo",
-        "ref",
-        "total_vectors",
-        "persist_dir",
-        "embedder",
-        "webhook_url",
-        "error",
-        "created_at",
-        "updated_at",
-    ]
-    job = dict(zip(keys, row))
-    if isinstance(job.get("created_at"), datetime):
-        job["created_at"] = job["created_at"].isoformat() + "Z"
-    if isinstance(job.get("updated_at"), datetime):
-        job["updated_at"] = job["updated_at"].isoformat() + "Z"
-    return job
-
-
-def create_job(
-    job_id: str,
-    namespace: str,
-    project_id: str,
-    filename: str,
-    status: str,
-    created_at: str,
-    updated_at: str,
-    webhook_url: Optional[str] = None,
-    source: Optional[str] = None,
-    owner: Optional[str] = None,
-    repo: Optional[str] = None,
-    ref: Optional[str] = None,
-) -> Dict[str, Any]:
-    conn = get_pool().getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO jobs (
-                    job_id, namespace, project_id, filename, status,
-                    source, owner, repo, ref, webhook_url,
-                    created_at, updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                RETURNING job_id, namespace, project_id, filename, status,
-                          source, owner, repo, ref, total_vectors,
-                          persist_dir, embedder, webhook_url, error,
-                          created_at, updated_at
-                """,
-                (
-                    job_id, namespace, project_id, filename, status,
-                    source, owner, repo, ref, webhook_url,
-                    created_at, updated_at,
-                ),
-            )
-            row = cur.fetchone()
-            conn.commit()
-            return _row_to_job(row)
-    finally:
-        get_pool().putconn(conn)
-
-
-def update_job(job_id: str, **updates) -> Dict[str, Any]:
-    if not updates:
-        return get_job(job_id)
-    updates["updated_at"] = updates.get("updated_at")
-    fields = []
-    values = []
-    for k, v in updates.items():
-        fields.append(f"{k} = %s")
-        values.append(v)
-    values.append(job_id)
-
-    conn = get_pool().getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE jobs
-                SET {", ".join(fields)}
-                WHERE job_id = %s
-                RETURNING job_id, namespace, project_id, filename, status,
-                          source, owner, repo, ref, total_vectors,
-                          persist_dir, embedder, webhook_url, error,
-                          created_at, updated_at
-                """,
-                values,
-            )
-            row = cur.fetchone()
-            conn.commit()
-            return _row_to_job(row)
-    finally:
-        get_pool().putconn(conn)
-
-
-def get_job(job_id: str) -> Dict[str, Any]:
-    conn = get_pool().getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT job_id, namespace, project_id, filename, status,
-                       source, owner, repo, ref, total_vectors,
-                       persist_dir, embedder, webhook_url, error,
-                       created_at, updated_at
-                FROM jobs
-                WHERE job_id = %s
-                """,
-                (job_id,),
-            )
-            row = cur.fetchone()
-            return _row_to_job(row)
-    finally:
-        get_pool().putconn(conn)
-
-
-def upsert_index_meta(namespace: str, project_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
-    now = datetime.utcnow().isoformat() + "Z"
-    conn = get_pool().getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO index_meta (
-                    namespace, project_id, embedder, model,
-                    embedding_dim, use_cloud, preferred_embedder,
-                    created_at, updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (namespace, project_id)
-                DO UPDATE SET
-                    embedder = EXCLUDED.embedder,
-                    model = EXCLUDED.model,
-                    embedding_dim = EXCLUDED.embedding_dim,
-                    use_cloud = EXCLUDED.use_cloud,
-                    preferred_embedder = EXCLUDED.preferred_embedder,
-                    updated_at = EXCLUDED.updated_at
-                RETURNING namespace, project_id, embedder, model,
-                          embedding_dim, use_cloud, preferred_embedder,
-                          created_at, updated_at
-                """,
-                (
-                    namespace,
-                    project_id,
-                    meta.get("embedder"),
-                    meta.get("model"),
-                    meta.get("embedding_dim"),
-                    bool(meta.get("use_cloud")),
-                    meta.get("preferred_embedder"),
-                    now,
-                    now,
-                ),
-            )
-            row = cur.fetchone()
-            conn.commit()
-            return {
-                "namespace": row[0],
-                "project_id": row[1],
-                "embedder": row[2],
-                "model": row[3],
-                "embedding_dim": row[4],
-                "use_cloud": row[5],
-                "preferred_embedder": row[6],
-                "created_at": row[7].isoformat() + "Z" if isinstance(row[7], datetime) else row[7],
-                "updated_at": row[8].isoformat() + "Z" if isinstance(row[8], datetime) else row[8],
-            }
-    finally:
-        get_pool().putconn(conn)
-
-
-def get_index_meta(namespace: str, project_id: str) -> Dict[str, Any]:
-    conn = get_pool().getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT namespace, project_id, embedder, model, embedding_dim,
-                       use_cloud, preferred_embedder, created_at, updated_at
-                FROM index_meta
-                WHERE namespace = %s AND project_id = %s
-                """,
-                (namespace, project_id),
-            )
-            row = cur.fetchone()
-            if not row:
-                return {}
-            return {
-                "namespace": row[0],
-                "project_id": row[1],
-                "embedder": row[2],
-                "model": row[3],
-                "embedding_dim": row[4],
-                "use_cloud": row[5],
-                "preferred_embedder": row[6],
-                "created_at": row[7].isoformat() + "Z" if isinstance(row[7], datetime) else row[7],
-                "updated_at": row[8].isoformat() + "Z" if isinstance(row[8], datetime) else row[8],
-            }
-    finally:
-        get_pool().putconn(conn)
-
-
-def update_preferred_embedder(namespace: str, project_id: str, preferred_embedder: Optional[str]) -> Dict[str, Any]:
-    """Update only the preferred_embedder column for a tenant.
-
-    If *preferred_embedder* is ``None`` the column is set to ``NULL``,
-    reverting to automatic embedder selection.
-    """
-    now = datetime.utcnow().isoformat() + "Z"
-    conn = get_pool().getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO index_meta (
-                    namespace, project_id, preferred_embedder,
-                    created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (namespace, project_id)
-                DO UPDATE SET
-                    preferred_embedder = EXCLUDED.preferred_embedder,
-                    updated_at = EXCLUDED.updated_at
-                RETURNING namespace, project_id, embedder, model, embedding_dim,
-                          use_cloud, preferred_embedder, created_at, updated_at
-                """,
-                (namespace, project_id, preferred_embedder, now, now),
-            )
-            row = cur.fetchone()
-            conn.commit()
-            return {
-                "namespace": row[0],
-                "project_id": row[1],
-                "embedder": row[2],
-                "model": row[3],
-                "embedding_dim": row[4],
-                "use_cloud": row[5],
-                "preferred_embedder": row[6],
-                "created_at": row[7].isoformat() + "Z" if isinstance(row[7], datetime) else row[7],
-                "updated_at": row[8].isoformat() + "Z" if isinstance(row[8], datetime) else row[8],
-            }
-    finally:
-        get_pool().putconn(conn)
-
-
-def delete_embeddings(namespace: str, project_id: str) -> None:
-    conn = get_pool().getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM embeddings WHERE namespace = %s AND project_id = %s",
-                (namespace, project_id),
-            )
-            cur.execute(
-                "DELETE FROM index_meta WHERE namespace = %s AND project_id = %s",
-                (namespace, project_id),
-            )
-            conn.commit()
-    finally:
-        get_pool().putconn(conn)
-
-
-def count_embeddings(namespace: str, project_id: str) -> int:
-    conn = get_pool().getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) FROM embeddings WHERE namespace = %s AND project_id = %s",
-                (namespace, project_id),
-            )
-            return int(cur.fetchone()[0])
-    finally:
-        get_pool().putconn(conn)
+...
