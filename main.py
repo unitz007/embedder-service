@@ -19,7 +19,15 @@ from store.pgvector_store import PgVectorStore
 from lib.embedder import CodeEmbedder, VoyageEmbedder, DEFAULT_MODEL
 import db
 
-app = FastAPI()
+
+async def lifespan(_: FastAPI):
+    db.init_db()
+    yield
+    db.close_pool()
+
+
+app = FastAPI(lifespan=lifespan)
+
 
 GITHUB_API_BASE = os.getenv("GITHUB_API_BASE", "https://api.github.com")
 GITHUB_API_VERSION = os.getenv("GITHUB_API_VERSION", "2022-11-28")
@@ -35,12 +43,6 @@ EMBEDDER = CodeEmbedder(DEFAULT_MODEL)
 # Sentence-transformers truncates to 512 tokens; Voyage AI has a ~32K token limit.
 # 50 000 characters is a safe upper bound for both.
 MAX_EMBED_TEXT_LENGTH = 50000
-
-
-@app.on_event("startup")
-def _startup():
-    db.init_db()
-
 
 
 class SearchRequest(BaseModel):
@@ -88,6 +90,7 @@ class EmbedRequest(BaseModel):
     )
     project_id: Optional[str] = Field(None, description="See namespace.")
 
+
 class GitHubIndexRequest(BaseModel):
     owner: Optional[str] = None
     repo: Optional[str] = None
@@ -104,7 +107,6 @@ def _require_bearer_token(request: Request) -> str:
     if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization: Bearer token")
     return auth.split(" ", 1)[1].strip()
-
 
 
 def _read_index_meta(namespace: str, project_id: str) -> dict:
@@ -198,8 +200,6 @@ def _github_validate_access(token: Optional[str], owner: str, repo: str) -> None
     raise HTTPException(status_code=resp.status_code, detail=f"GitHub auth failed: {resp.text}")
 
 
-
-
 def safe_extract(zip_ref, path):
     for member in zip_ref.namelist():
         member_path = os.path.abspath(os.path.join(path, member))
@@ -252,6 +252,7 @@ def process_zip(temp_dir, zip_path, namespace, project_id, job_id):
 def read_root():
     return FileResponse(os.path.join(os.path.dirname(__file__), "web", "index.html"))
 
+
 @app.post("/embeddings/{namespace}/{project_id}")
 async def post_embeddings(
         request: Request,
@@ -279,6 +280,7 @@ async def post_embeddings(
         "namespace": namespace,
         "project_id": project_id
     }
+
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, request: Request):
