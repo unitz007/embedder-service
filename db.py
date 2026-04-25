@@ -34,6 +34,17 @@ def get_database_url() -> str:
 
 
 def get_pool() -> ThreadedConnectionPool:
+
+def close_pool() -> None:
+    """Gracefully close and drop the connection pool.
+
+    Closes all connections and clears the global pool reference.  Safe to call
+    multiple times; idempotent.
+    """
+    global _POOL
+    if _POOL is not None:
+        _POOL.closeall()
+        _POOL = None
     global _POOL
     if _POOL is None:
         maxconn = int(os.getenv("DB_POOL_MAX", "20"))
@@ -41,6 +52,8 @@ def get_pool() -> ThreadedConnectionPool:
             minconn=2,
             maxconn=maxconn,
             dsn=get_database_url(),
+            connect_timeout=10,
+            options='-c statement_timeout=30000',
         )
     return _POOL
 

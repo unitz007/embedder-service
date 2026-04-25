@@ -19,7 +19,12 @@ from store.pgvector_store import PgVectorStore
 from lib.embedder import CodeEmbedder, VoyageEmbedder, DEFAULT_MODEL
 import db
 
-app = FastAPI()
+async def lifespan(_: FastAPI):
+    db.init_db()
+    yield
+    db.close_pool()
+
+app = FastAPI(lifespan=lifespan)
 
 GITHUB_API_BASE = os.getenv("GITHUB_API_BASE", "https://api.github.com")
 GITHUB_API_VERSION = os.getenv("GITHUB_API_VERSION", "2022-11-28")
@@ -37,7 +42,7 @@ EMBEDDER = CodeEmbedder(DEFAULT_MODEL)
 MAX_EMBED_TEXT_LENGTH = 50000
 
 
-@app.on_event("startup")
+
 def _startup():
     db.init_db()
 
