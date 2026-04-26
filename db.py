@@ -2,11 +2,25 @@ import os
 from datetime import datetime
 from typing import Optional
 
+import hashlib
+import json
+import os
+from datetime import datetime
+from typing import Optional, List
+
 import psycopg2
+from psycopg2.extras import execute_values
+from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.pool import ThreadedConnectionPool
 
 
 _POOL: Optional[ThreadedConnectionPool] = None
+
+_POOL: Optional[ThreadedConnectionPool] = None
+
+
+def _vector_str(vec: List[float]) -> str:
+    return "[" + ",".join(str(float(x)) for x in vec) + "]"
 
 
 def _normalize_db_url(url: str, app_env: str) -> str:
@@ -47,6 +61,171 @@ def get_pool() -> ThreadedConnectionPool:
         options='-c statement_timeout=30000',
     )
     return _POOL
+
+
+def cache_get_embeddings(project_id: str, file_path: str) -> Optional[list]:
+    """Get cached embeddings for a file from the database."""
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT chunk_id, embedding 
+                FROM embeddings 
+                WHERE project_id = %s AND file_path = %s
+                ORDER BY chunk_id
+                """,
+                (project_id, file_path),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return None
+            return [(row[0], row[1]) for row in rows]
+    except Exception as e:
+        print(f"Error fetching cached embeddings: {e}")
+        return None
+    finally:
+        get_pool().putconn(conn)
+
+
+def cache_set_embeddings(project_id: str, file_path: str, embeddings: list) -> None:
+    """Cache computed embeddings for a file in the database."""
+    if not embeddings:
+        return
+    
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            # Delete existing embeddings for this file
+            cur.execute(
+                "DELETE FROM embeddings WHERE project_id = %s AND file_path = %s",
+                (project_id, file_path),
+            )
+            
+            # Insert new embeddings
+            execute_values(
+                cur,
+                """
+                INSERT INTO embeddings (
+                    project_id, file_path, chunk_id, embedding, created_at
+                ) VALUES %s
+                """,
+                [
+                    (
+                        project_id,
+                        file_path,
+                        emb[0],  # chunk_id
+                        _vector_str(emb[1]),  # embedding
+                        datetime.now(),
+                    )
+                    for emb in embeddings
+                ],
+                template="(%s,%s,%s,%s::vector,%s),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"Error setting cached embeddings: {e}")
+        conn.rollback()
+    finally:
+        get_pool().putconn(conn)
+
+
+def count_embeddings(namespace: str, project_id: str) -> int:
+    """Count the number of embeddings for a project."""
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM embeddings WHERE namespace = %s AND project_id = %s",
+                (namespace, project_id),
+            )
+            row = cur.fetchone()
+            return row[0] if row else 0
+    finally:
+        get_pool().putconn(conn)
+
+def cache_get_embeddings(keys: List[Tuple[bytes, str]]) -> Dict[bytes, List[float]]:
+    """Get cached embeddings from the database.
+    
+    Args:
+        keys: List of (hash, model_name) tuples
+        
+    Returns:
+        Dictionary mapping hash -> embedding vector
+    """
+    if not keys:
+        return {}
+    
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            # Create a temporary table with our keys for efficient lookup
+            cur.execute("""
+                CREATE TEMP TABLE temp_keys (
+                    hash BYTEA,
+                    model_name TEXT
+                )
+            """)
+            
+            # Insert keys
+            execute_values(
+                cur,
+                "INSERT INTO temp_keys (hash, model_name) VALUES %s",
+                keys
+            )
+            
+            # Join with embeddings table
+            cur.execute("""
+                SELECT e.hash, e.embedding
+                FROM embeddings_cache e
+                INNER JOIN temp_keys t ON e.hash = t.hash AND e.model_name = t.model_name
+            """)
+            
+            results = {}
+            for hash_val, embedding in cur.fetchall():
+                results[hash_val] = embedding
+            
+            return results
+    except Exception as e:
+        print(f"Error getting cached embeddings: {e}")
+        return {}
+    finally:
+        get_pool().putconn(conn)
+
+
+def cache_store_embeddings(rows: List[Tuple[bytes, str, List[float]]]) -> None:
+    """Store embeddings in the cache.
+    
+    Args:
+        rows: List of (hash, model_name, embedding) tuples
+    """
+    if not rows:
+        return
+    
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO embeddings_cache (hash, model_name, embedding, created_at)
+                VALUES %s
+                ON CONFLICT (hash, model_name) DO UPDATE SET
+                    embedding = EXCLUDED.embedding,
+                    created_at = EXCLUDED.created_at
+                """,
+                [
+                    (hash_val, model_name, embedding, datetime.now())
+                    for hash_val, model_name, embedding in rows
+                ],
+                template="(%s,%s,%s,%s)"
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"Error storing embeddings in cache: {e}")
+        conn.rollback()
+    finally:
+        get_pool().putconn(conn)
 
 
 def close_pool() -> None:
@@ -142,6 +321,32 @@ def init_db() -> None:
                 """
                 CREATE INDEX IF NOT EXISTS embeddings_vec_idx
                 ON embeddings USING ivfflat (embedding vector_cosine_ops)
+                """
+            )            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS embeddings_vec_idx
+                ON embeddings USING ivfflat (embedding vector_cosine_ops)
+                """
+            )
+            
+            # Create embeddings cache table for storing cached embeddings
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS embeddings_cache (
+                    hash BYTEA NOT NULL,
+                    model_name TEXT NOT NULL,
+                    embedding VECTOR(1024), -- Support both 768 and 1024 dims
+                    created_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (hash, model_name)
+                )
+                """
+            )
+            
+            # Add index for faster lookups
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS embeddings_cache_hash_idx 
+                ON embeddings_cache (hash)
                 """
             )
             conn.commit()

@@ -125,13 +125,22 @@ class EmbeddingCache:
             *miss_indices* is the list of indices that were **not** in the cache.
         """
         keys: List[Tuple[bytes, str]] = []
-        index_by_hash: Dict[bytes, int] = {}
-        for i, text in enumerate(texts):
-            h = self.hash_text(text)
-            keys.append((h, model_name))
-            index_by_hash[h] = i
-
-        cached = self._db.cache_get_embeddings(keys)
+        # Convert texts to hashes
+        hashes = [self.hash_text(text) for text in texts]
+        
+        # Create key tuples for database lookup
+        keys = [(h, model_name) for h in hashes]
+        
+        # Get cached embeddings
+        cached_dict = self._db.cache_get_embeddings(keys)
+        
+        # Map to the expected format
+        cached = {}
+        for h in hashes:
+            for key_tuple, embedding in cached_dict.items():
+                if key_tuple[0] == h:  # Match by hash
+                    cached[h] = embedding
+                    break
 
         hits: Dict[int, List[float]] = {}
         miss_indices: List[int] = []
