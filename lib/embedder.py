@@ -314,7 +314,7 @@ class CodeEmbedder:
 
             encoded = {k: v.to(self.device) for k, v in encoded.items()}
 
-            with torch.no_grad():
+            with torch.inference_mode():
 
                 outputs = self._model(**encoded)
 
@@ -443,12 +443,7 @@ class CodeEmbedder:
         embeddings = self.encode(texts)
 
         for i, chunk in enumerate(chunks):
-
-            updated = chunk.copy()
-
-            updated["embedding"] = embeddings[i].tolist()
-
-            chunks[i] = updated
+            chunk["embedding"] = embeddings[i].tolist()
 
         return chunks
 
@@ -558,9 +553,7 @@ class VoyageEmbedder:
         texts = [c["content"] for c in chunks]
         embeddings = self.encode(texts)
         for i, chunk in enumerate(chunks):
-            updated = chunk.copy()
-            updated["embedding"] = embeddings[i].tolist()
-            chunks[i] = updated
+            chunk["embedding"] = embeddings[i].tolist()
         return chunks
 
 

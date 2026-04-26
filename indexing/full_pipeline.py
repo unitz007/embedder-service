@@ -11,6 +11,11 @@ import os
 import pickle
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 from lib.chunker import chunk_repository_analyses
 from lib.embedder import (
@@ -83,13 +88,24 @@ def index_repository(
         # No cache — convert relative paths to absolute for analyze_file()
         files = [os.path.join(repo_path, f) for f in files]
 
-    results = []
-    for file in files:
-        analysis = analyze_file(file)
-        if analysis:
-            results.append(analysis)
+    results = [None] * len(files)
 
-    return results
+    # Use concurrent file analysis for better I/O-bound throughput
+    max_workers = min(8, max(1, os.cpu_count() or 1))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(analyze_file, file): idx
+            for idx, file in enumerate(files)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                analysis = future.result()
+                results[idx] = analysis
+            except Exception as exc:
+                logger.warning("Failed to analyze %s: %s", files[idx], exc)
+
+    return [r for r in results if r is not None]
 
 
 def chunk_analyses(analyses: List[Any]) -> List[Dict[str, Any]]:

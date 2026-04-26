@@ -80,8 +80,8 @@ def build_import_graph(analyses: List[FileAnalysis]) -> Dict[str, Dict]:
     all_files: Set[str] = {a.file_path for a in analyses}
     graph: Dict[str, Dict] = {
         a.file_path: {
-            "depends_on": [],
-            "imported_by": [],
+            "depends_on": set(),
+            "imported_by": set(),
             "unresolved_imports": [],
             "package": a.package,
         }
@@ -89,15 +89,20 @@ def build_import_graph(analyses: List[FileAnalysis]) -> Dict[str, Dict]:
     }
 
     for analysis in analyses:
+        depends = graph[analysis.file_path]["depends_on"]
+        unresolved = graph[analysis.file_path]["unresolved_imports"]
         for imp in analysis.imports:
             resolved = _resolve_import(imp, analysis.file_path, all_files, analysis.language)
             if resolved and resolved != analysis.file_path and resolved in graph:
-                if resolved not in graph[analysis.file_path]["depends_on"]:
-                    graph[analysis.file_path]["depends_on"].append(resolved)
-                if analysis.file_path not in graph[resolved]["imported_by"]:
-                    graph[resolved]["imported_by"].append(analysis.file_path)
+                depends.add(resolved)
+                graph[resolved]["imported_by"].add(analysis.file_path)
             else:
-                graph[analysis.file_path]["unresolved_imports"].append(imp)
+                unresolved.append(imp)
+
+    # Convert sets back to lists for JSON serialisation
+    for node in graph.values():
+        node["depends_on"] = list(node["depends_on"])
+        node["imported_by"] = list(node["imported_by"])
 
     return graph
 
@@ -162,7 +167,7 @@ def _extract_all_calls_python(analysis: FileAnalysis) -> Dict[str, List[str]]:
 
 def _collect_calls_recursive(node: Any, call_type: str, func_field: str, method_type: str, method_field: str) -> List[str]:
     """
-    Generic recursive call collector for tree-sitter nodes.
+    Iterative call collector for tree-sitter nodes.
 
     Args:
         node: tree-sitter node to walk
@@ -173,17 +178,22 @@ def _collect_calls_recursive(node: Any, call_type: str, func_field: str, method_
         method_field: field name for the method name within qualified calls
     """
     calls = []
-    if node.type == call_type:
-        callee = node.child_by_field_name(func_field)
-        if callee:
-            if callee.type == "identifier":
-                calls.append(callee.text.decode("utf-8", errors="ignore"))
-            elif callee.type == method_type:
-                field = callee.child_by_field_name(method_field)
-                if field:
-                    calls.append(field.text.decode("utf-8", errors="ignore"))
-    for child in node.children:
-        calls.extend(_collect_calls_recursive(child, call_type, func_field, method_type, method_field))
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        if node.type == call_type:
+            callee = node.child_by_field_name(func_field)
+            if callee:
+                if callee.type == "identifier":
+                    calls.append(callee.text.decode("utf-8", errors="ignore"))
+                elif callee.type == method_type:
+                    field = callee.child_by_field_name(method_field)
+                    if field:
+                        calls.append(field.text.decode("utf-8", errors="ignore"))
+        # Push children in reverse order so leftmost is processed first
+        children = node.children
+        if children:
+            stack.extend(reversed(children))
     return calls
 
 
