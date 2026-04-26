@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 import db
 from lib import embedder
 from lib import chunker
+from lib.embedder import DEFAULT_MAX_CONCURRENCY, embed_chunks_parallel
 from store.pgvector_store import PgVectorStore
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ def run_indexing(
     embedder_name: Optional[str] = None,
     use_cloud: bool = False,
     force: bool = False,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> Dict[str, Any]:
     """Chunk, embed and store *input_path* into pgvector.
 
@@ -79,6 +81,10 @@ def run_indexing(
     force : bool
         When *True* re-embed from scratch even if a prior index exists
         with the same embedder.
+    max_concurrency : int
+        Number of concurrent embedding batches.  ``1`` disables parallelism
+        (original sequential behaviour).  Higher values increase throughput
+        at the cost of memory usage.
 
     Returns
     -------
@@ -152,8 +158,21 @@ def run_indexing(
         store.clear()
 
     # ── Embedding ──────────────────────────────────────────────────
-    logger.info("Embedding %d chunks (model: %s) …", len(chunks), resolved_model)
-    embedded_chunks = embedder_instance.embed_chunks(chunks)
+    logger.info("Embedding %d chunks (model: %s, concurrency: %d) …", len(chunks), resolved_model, max_concurrency)
+
+    if max_concurrency <= 1:
+        embedded_chunks = embedder_instance.embed_chunks(chunks)
+        embed_failures = []
+    else:
+        embedded_chunks, embed_failures = embed_chunks_parallel(
+            chunks, embedder_instance, max_concurrency=max_concurrency,
+        )
+
+    if embed_failures:
+        logger.warning(
+            "%d embedding failures out of %d chunks",
+            len(embed_failures), len(chunks),
+        )
 
     # ── Persist to pgvector ────────────────────────────────────────
     vectors = [c["embedding"] for c in embedded_chunks]

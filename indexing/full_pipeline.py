@@ -10,7 +10,7 @@ import json
 import os
 import pickle
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from lib.chunker import chunk_repository_analyses
 from lib.embedder import (
@@ -22,6 +22,8 @@ from lib.embedder import (
     VOYAGE_EMBEDDING_DIM,
     VOYAGE_MODEL,
     DEFAULT_MODEL,
+    DEFAULT_MAX_CONCURRENCY,
+    embed_chunks_parallel,
 )
 from lib.graph import (
     build_import_graph, enrich_chunks_with_graph,
@@ -106,18 +108,35 @@ def generate_embeddings(
     chunks: List[Dict[str, Any]],
     model_name: str = "microsoft/codebert-base",
     embedder=None,
-) -> List[Dict[str, Any]]:
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Step 7: Embedding Generation
+    Step 7: Embedding Generation (with optional concurrency).
 
     If ``embedder`` is provided it is used directly; otherwise a local
     CodeEmbedder is instantiated from ``model_name``.
 
-    Returns: List of chunks with embeddings added
+    When *max_concurrency* > 1, chunks are embedded in parallel batches
+    using a thread pool.  Individual batch failures are logged and skipped;
+    the caller receives both the successful embeddings and a list of failures.
+
+    Returns:
+        ``(chunks_with_embeddings, failures)``
     """
-    if embedder is not None:
-        return embedder.embed_chunks(chunks)
-    return embed_repository_chunks(chunks, model_name)
+    if max_concurrency <= 1:
+        # Sequential path
+        if embedder is not None:
+            embedded = embedder.embed_chunks(chunks)
+        else:
+            embedded = embed_repository_chunks(chunks, model_name)
+        return embedded, []
+
+    # Concurrent path
+    effective_embedder = embedder or CodeEmbedder(model_name)
+    embedded, failures = embed_chunks_parallel(
+        chunks, effective_embedder, max_concurrency=max_concurrency,
+    )
+    return embedded, failures
 
 def search_code(
     vector_store,
@@ -168,6 +187,7 @@ def full_pipeline_chroma(
     graphs_prefix: str = None,
     model_name: str = "microsoft/codebert-base",
     include_dotfiles: bool = False,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> tuple:
     """
     Run the complete pipeline and store vectors in Chroma instead of FAISS.
@@ -183,6 +203,7 @@ def full_pipeline_chroma(
                           land next to the Chroma dir.
         model_name:       Embedding model (sentence-transformers).
         include_dotfiles: Include hidden files.
+        max_concurrency:  Parallel embedding batch count (1 = sequential).
 
     Returns:
         Tuple of (ChromaStore, call_graph dict, import_graph dict)
@@ -224,7 +245,10 @@ def full_pipeline_chroma(
         )
         embedder = CodeEmbedder(model_name)
 
-    chunks_with_embeddings = generate_embeddings(chunks, embedder=embedder)
+    chunks_with_embeddings, embed_failures = generate_embeddings(chunks, embedder=embedder, max_concurrency=max_concurrency)
+
+    if embed_failures:
+        print(f"Step 7: {len(embed_failures)} embedding failures out of {len(chunks)} chunks")
 
     # Step 8: Store in Chroma.
     # We use add_vectors(replace_all=True) instead of clear() + add_vectors().
@@ -288,6 +312,7 @@ def full_pipeline_pgvector(
     model_name: str = "microsoft/codebert-base",
     include_dotfiles: bool = False,
     preferred_embedder: Optional[str] = None,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> tuple:
     """
     Run the complete pipeline and store vectors in Postgres/pgvector.
@@ -303,6 +328,7 @@ def full_pipeline_pgvector(
                              starting with ``voyage-`` route to
                              :class:`VoyageEmbedder`; anything else is passed
                              to :class:`CodeEmbedder`.
+        max_concurrency:  Parallel embedding batch count (1 = sequential).
 
     Returns:
         Tuple of (PgVectorStore, call_graph dict, import_graph dict, index_meta dict)
@@ -352,7 +378,10 @@ def full_pipeline_pgvector(
         )
         embedder = CodeEmbedder(model_name)
 
-    chunks_with_embeddings = generate_embeddings(chunks, embedder=embedder)
+    chunks_with_embeddings, embed_failures = generate_embeddings(chunks, embedder=embedder, max_concurrency=max_concurrency)
+
+    if embed_failures:
+        print(f"Step 7: {len(embed_failures)} embedding failures out of {len(chunks)} chunks")
 
     # Step 8: Store in Postgres/pgvector (replace_all to avoid stale vectors)
     print("Step 8: Storing in pgvector...")

@@ -16,6 +16,10 @@ import hashlib
 import os
 import logging
 
+import asyncio
+import concurrent.futures
+import threading
+
 # Suppress HuggingFace telemetry but allow model downloads on first run
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
@@ -45,6 +49,7 @@ VOYAGE_API_URL = "https://api.voyageai.com/v1/embeddings"
 VOYAGE_MODEL = "voyage-code-3"
 VOYAGE_EMBEDDING_DIM = 1024
 VOYAGE_BATCH_SIZE = 128  # max texts per Voyage AI request
+DEFAULT_MAX_CONCURRENCY = 8  # sensible default for concurrent chunk embedding
 
 
 # -------------------------------------------------------------------
@@ -454,6 +459,168 @@ class CodeEmbedder:
 
 
 # -------------------------------------------------------------------
+# Concurrent embedding helper
+# -------------------------------------------------------------------
+
+def embed_chunks_parallel(
+    chunks: List[Dict[str, Any]],
+    embedder,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+) -> List[Dict[str, Any]]:
+    """Embed *chunks* using *embedder* with bounded parallelism.
+
+    For local (sync) embedders the work is distributed across a
+    ``ThreadPoolExecutor`` so that CPU-bound encode calls and the
+    internal batching of the model run concurrently for different
+    sub-batches.  Errors in individual chunks are logged and skipped;
+    a summary of failures is returned.
+
+    Args:
+        chunks:          List of chunk dicts (must contain ``"content"``).
+        embedder:        Any object with an ``embed_chunks(chunks)`` method.
+        max_concurrency: Maximum number of in-flight sub-batches.
+
+    Returns:
+        ``(embedded_chunks, failures)`` where *failures* is a list of
+        ``{index, error}`` dicts for chunks that could not be embedded.
+    """
+    if not chunks:
+        return chunks, []
+
+    if max_concurrency <= 1:
+        # Sequential path — no threading overhead
+        try:
+            return embedder.embed_chunks(chunks), []
+        except Exception as exc:
+            logger.error("Sequential embedding failed: %s", exc)
+            return [], [{"index": 0, "error": str(exc), "count": len(chunks)}]
+
+    # Split chunks into sub-batches for parallel processing.
+    # Use a batch size that keeps each worker busy but not overloaded.
+    batch_size = max(1, len(chunks) // max_concurrency)
+    batch_size = min(batch_size, 32)  # cap at 32 per batch
+    batch_size = max(batch_size, 1)
+
+    sub_batches = [
+        chunks[i : i + batch_size]
+        for i in range(0, len(chunks), batch_size)
+    ]
+
+    results: List[Optional[List[Dict[str, Any]]]] = [None] * len(sub_batches)
+    failures: List[Dict[str, Any]] = []
+    lock = threading.Lock()
+
+    def _embed_batch(idx: int, batch: List[Dict[str, Any]]) -> None:
+        try:
+            results[idx] = embedder.embed_chunks(batch)
+        except Exception as exc:
+            logger.error(
+                "Embedding batch %d failed (%d chunks): %s",
+                idx, len(batch), exc,
+            )
+            with lock:
+                for j, chunk in enumerate(batch):
+                    original_idx = idx * batch_size + j
+                    if original_idx < len(chunks):
+                        failures.append({
+                            "index": original_idx,
+                            "error": str(exc),
+                            "file_path": chunk.get("metadata", {}).get("file_path", "unknown"),
+                        })
+            results[idx] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+        futures = {
+            pool.submit(_embed_batch, i, batch): i
+            for i, batch in enumerate(sub_batches)
+        }
+        concurrent.futures.wait(futures)
+
+    # Reassemble in original order
+    embedded: List[Dict[str, Any]] = []
+    for batch_result in results:
+        if batch_result is not None:
+            embedded.extend(batch_result)
+
+    if failures:
+        logger.warning(
+            "Embedding completed with %d failures out of %d chunks",
+            len(failures), len(chunks),
+        )
+
+    return embedded, failures
+
+
+# -------------------------------------------------------------------
+# Async concurrent embedding (for callers already in an async loop)
+# -------------------------------------------------------------------
+
+async def embed_chunks_async(
+    chunks: List[Dict[str, Any]],
+    embedder,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+) -> List[Dict[str, Any]]:
+    """Async version of :func:`embed_chunks_parallel`.
+
+    Runs sync embedder calls in a thread pool under an asyncio semaphore
+    so the caller's event loop is not blocked.
+    """
+    if not chunks:
+        return chunks
+
+    if max_concurrency <= 1:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, embedder.embed_chunks, chunks)
+
+    batch_size = max(1, len(chunks) // max_concurrency)
+    batch_size = min(batch_size, 32)
+    batch_size = max(batch_size, 1)
+
+    sub_batches = [
+        chunks[i : i + batch_size]
+        for i in range(0, len(chunks), batch_size)
+    ]
+
+    semaphore = asyncio.Semaphore(max_concurrency)
+    failures: List[Dict[str, Any]] = []
+    loop = asyncio.get_running_loop()
+
+    async def _embed_batch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        async with semaphore:
+            try:
+                return await loop.run_in_executor(
+                    None, embedder.embed_chunks, batch,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Async embedding batch failed (%d chunks): %s",
+                    len(batch), exc,
+                )
+                for chunk in batch:
+                    failures.append({
+                        "error": str(exc),
+                        "file_path": chunk.get("metadata", {}).get("file_path", "unknown"),
+                    })
+                return []
+
+    batch_results = await asyncio.gather(
+        *[_embed_batch(b) for b in sub_batches],
+    )
+
+    embedded: List[Dict[str, Any]] = []
+    for result in batch_results:
+        embedded.extend(result)
+
+    if failures:
+        logger.warning(
+            "Async embedding completed with %d failures out of %d chunks",
+            len(failures), len(chunks),
+        )
+
+    return embedded
+
+
+# -------------------------------------------------------------------
 # Cloud embedder — Voyage AI
 # -------------------------------------------------------------------
 
@@ -574,3 +741,80 @@ def embed_repository_chunks(
 ) -> List[Dict[str, Any]]:
 
     return CodeEmbedder(model_name).embed_chunks(chunks)
+
+# -------------------------------------------------------------------
+# Async Voyage embedder wrapper
+# -------------------------------------------------------------------
+
+class AsyncVoyageEmbedder:
+    """Async wrapper around VoyageEmbedder.
+
+    Uses httpx for non-blocking HTTP requests and a semaphore to bound
+    concurrency.  Falls back to thread-pool execution when httpx is
+    not available.
+    """
+
+    def __init__(self, api_key: str | None = None, input_type: str = "document",
+                 cache: Optional[EmbeddingCache] = None,
+                 max_concurrency: int = DEFAULT_MAX_CONCURRENCY):
+        self._sync = VoyageEmbedder(api_key=api_key, input_type=input_type, cache=cache)
+        self._max_concurrency = max_concurrency
+        self._httpx = None
+        try:
+            import httpx  # noqa: F401
+            self._httpx = httpx
+        except ImportError:
+            pass
+
+    @property
+    def dim(self) -> int:
+        return self._sync.dim
+
+    @property
+    def model_name(self) -> str:
+        return VOYAGE_MODEL
+
+    async def encode(self, texts: List[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self._sync._dim), dtype=np.float32)
+
+        # Cache path
+        if self._sync._cache is not None:
+            hits, miss_indices = self._sync._cache.get(texts, VOYAGE_MODEL)
+            if not miss_indices:
+                result = np.empty((len(texts), self._sync._dim), dtype=np.float32)
+                for idx, emb_list in hits.items():
+                    result[idx] = np.array(emb_list, dtype=np.float32)
+                return result
+
+            miss_texts = [texts[i] for i in miss_indices]
+            loop = asyncio.get_running_loop()
+            miss_embeddings = await loop.run_in_executor(
+                None, self._sync._encode_via_api, miss_texts,
+            )
+
+            miss_hashes = [self._sync._cache.hash_text(texts[i]) for i in miss_indices]
+            self._sync._cache.store(miss_hashes, VOYAGE_MODEL, miss_embeddings)
+
+            result = np.empty((len(texts), self._sync._dim), dtype=np.float32)
+            for idx, emb_list in hits.items():
+                result[idx] = np.array(emb_list, dtype=np.float32)
+            for local_i, global_i in enumerate(miss_indices):
+                result[global_i] = miss_embeddings[local_i]
+            return result
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._sync._encode_via_api, texts,
+        )
+
+    async def embed_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not chunks:
+            return chunks
+        texts = [c["content"] for c in chunks]
+        embeddings = await self.encode(texts)
+        for i, chunk in enumerate(chunks):
+            updated = chunk.copy()
+            updated["embedding"] = embeddings[i].tolist()
+            chunks[i] = updated
+        return chunks
