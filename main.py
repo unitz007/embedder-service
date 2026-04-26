@@ -50,6 +50,7 @@ class SearchRequest(BaseModel):
     project_id: str
     embedding: List[float] = Field(..., description="Embedding vector to search with")
     k: Optional[int] = Field(5, description="Number of results to return")
+    offset: Optional[int] = Field(0, ge=0, description="Number of results to skip (pagination)")
     text: Optional[str] = Field(
         None,
         description=(
@@ -66,6 +67,7 @@ class TextSearchRequest(BaseModel):
     project_id: str
     query: str = Field(..., description="Raw query text to search with")
     k: Optional[int] = Field(5, description="Number of results to return")
+    offset: Optional[int] = Field(0, ge=0, description="Number of results to skip (pagination)")
 
 
 class EmbedRequest(BaseModel):
@@ -351,11 +353,12 @@ def search_embeddings(req: SearchRequest):
             embedding = EMBEDDER.encode([req.text])[0].tolist()
 
     store = PgVectorStore(namespace=req.namespace, project_id=req.project_id)
-    results = store.search(embedding, k=req.k or 5)
+    results = store.search(embedding, k=req.k or 5, offset=req.offset or 0)
     return {
         "namespace": req.namespace,
         "project_id": req.project_id,
         "k": req.k or 5,
+        "offset": req.offset or 0,
         "results": [
             {
                 "metadata": meta,
@@ -384,11 +387,12 @@ def search_by_text(req: TextSearchRequest):
         embedding = EMBEDDER.encode([req.query])[0].tolist()
 
     store = PgVectorStore(namespace=req.namespace, project_id=req.project_id)
-    results = store.search(embedding, k=req.k or 5)
+    results = store.search(embedding, k=req.k or 5, offset=req.offset or 0)
     return {
         "namespace": req.namespace,
         "project_id": req.project_id,
         "k": req.k or 5,
+        "offset": req.offset or 0,
         "embedder": index_meta.get("embedder", "unknown"),
         "results": [
             {

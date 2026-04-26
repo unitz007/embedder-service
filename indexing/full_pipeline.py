@@ -9,6 +9,7 @@ Embedding Generation -> Chroma Vector DB -> ContextBuilder (LLM-ready)
 import json
 import os
 import pickle
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -325,9 +326,12 @@ def full_pipeline_pgvector(
     """
     print(f"Starting pgvector pipeline for repository: {repo_path}")
     print("=" * 50)
+    t0 = time.time()
 
     # Steps 1-5: Symbol extraction
     analyses = index_repository(repo_path, include_dotfiles=include_dotfiles)
+    t1 = time.time()
+    logger.info("Step 1-5 (symbol extraction): %.1f ms — %d files", (t1 - t0) * 1000, len(analyses))
 
     # Step 5b: Import graph
     print("Step 5b: Building import relationship graph...")
@@ -336,11 +340,15 @@ def full_pipeline_pgvector(
     # Step 5c: Call graph
     print("Step 5c: Building call graph...")
     call_graph = build_call_graph(analyses)
+    t2 = time.time()
+    logger.info("Step 5b-5c (graphs): %.1f ms", (t2 - t1) * 1000)
 
     # Step 6: Chunking + graph enrichment
     chunks = chunk_analyses(analyses)
     chunks = enrich_chunks_with_graph(chunks, import_graph)
     chunks = enrich_chunks_with_call_graph(chunks, call_graph)
+    t3 = time.time()
+    logger.info("Step 6 (chunking + enrichment): %.1f ms — %d chunks", (t3 - t2) * 1000, len(chunks))
 
     # Step 7: Embeddings — per-tenant override or size-based heuristic
     if preferred_embedder is not None:
@@ -369,6 +377,8 @@ def full_pipeline_pgvector(
         embedder = CodeEmbedder(model_name)
 
     chunks_with_embeddings = generate_embeddings(chunks, embedder=embedder)
+    t4 = time.time()
+    logger.info("Step 7 (embedding): %.1f ms — %d chunks", (t4 - t3) * 1000, len(chunks))
 
     # Step 8: Store in Postgres/pgvector (replace_all to avoid stale vectors)
     print("Step 8: Storing in pgvector...")
@@ -379,6 +389,8 @@ def full_pipeline_pgvector(
         store.add_vectors(embeddings, metadata, replace_all=True)
     else:
         store.add_vectors([], [], replace_all=True)
+    t5 = time.time()
+    logger.info("Step 8 (pgvector store): %.1f ms", (t5 - t4) * 1000)
 
     # Build index metadata so callers know which embedder was used
     is_cloud = isinstance(embedder, VoyageEmbedder)
@@ -392,4 +404,19 @@ def full_pipeline_pgvector(
 
     print("=" * 50)
     print("pgvector pipeline completed!")
+
+    pipeline_ms = round((time.time() - t0) * 1000)
+    perf = {
+        "total_ms": pipeline_ms,
+        "step_index_repository_ms": round((t1 - t0) * 1000),
+        "step_graphs_ms": round((t2 - t1) * 1000),
+        "step_chunking_ms": round((t3 - t2) * 1000),
+        "step_embedding_ms": round((t4 - t3) * 1000),
+        "step_store_ms": round((t5 - t4) * 1000),
+        "chunks": len(chunks),
+        "files": len(analyses),
+    }
+    print(f"Pipeline performance: {json.dumps(perf, indent=2)}")
+    logger.info("Pipeline performance: %s", json.dumps(perf))
+
     return store, call_graph, import_graph, index_meta

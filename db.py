@@ -306,6 +306,21 @@ def get_index_meta(namespace: str, project_id: str) -> Optional[dict]:
         get_pool().putconn(conn)
 
 
+def count_embeddings(namespace: str, project_id: str) -> int:
+    """Return the total number of embedding rows for a namespace/project."""
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM embeddings WHERE namespace = %s AND project_id = %s",
+                (namespace, project_id),
+            )
+            row = cur.fetchone()
+            return row[0] if row else 0
+    finally:
+        get_pool().putconn(conn)
+
+
 def upsert_index_meta(namespace: str, project_id: str, meta: dict) -> None:
     conn = get_pool().getconn()
     try:
@@ -336,5 +351,30 @@ def upsert_index_meta(namespace: str, project_id: str, meta: dict) -> None:
                 ),
             )
             conn.commit()
+    finally:
+        get_pool().putconn(conn)
+
+
+def update_job_index_meta(namespace: str, project_id: str, data: dict) -> dict:
+    """Best-effort update of embedder metadata on the most recent job row."""
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE jobs SET
+                    embedder = %s,
+                    updated_at = %s
+                WHERE namespace = %s AND project_id = %s
+                  AND status IN ('completed', 'running', 'queued')
+                ORDER BY created_at DESC
+                LIMIT 1
+                RETURNING job_id
+                """,
+                (data.get("embedder"), data.get("updated_at"), namespace, project_id),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return {"job_id": row[0]} if row else {}
     finally:
         get_pool().putconn(conn)

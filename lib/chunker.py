@@ -282,8 +282,40 @@ def chunk_file_analysis(analysis: FileAnalysis) -> List[Dict[str, Any]]:
 
 
 def chunk_repository_analyses(analyses: List[FileAnalysis]) -> List[Dict[str, Any]]:
-    """Chunk all FileAnalysis objects from a repository."""
-    all_chunks = []
-    for analysis in analyses:
-        all_chunks.extend(chunk_file_analysis(analysis))
+    """Chunk all FileAnalysis objects from a repository.
+
+    Chunks are produced in file-order so downstream graph enrichment is
+    deterministic.  A ThreadPoolExecutor is used so that I/O-bound work
+    (reading files) overlaps across files.
+    """
+    if not analyses:
+        return []
+
+    # Serial for small repos to avoid executor overhead
+    if len(analyses) <= 4:
+        return [chunk for a in analyses for chunk in chunk_file_analysis(a)]
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    all_chunks: List[Dict[str, Any]] = []
+    # Preserve file ordering — map future → original index
+    from concurrent.futures import as_completed
+
+    max_workers = min(8, max(1, len(analyses)))
+    results: Dict[int, List[Dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(chunk_file_analysis, a): i
+            for i, a in enumerate(analyses)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception:
+                results[idx] = []
+
+    for i in range(len(analyses)):
+        all_chunks.extend(results.get(i, []))
+
     return all_chunks

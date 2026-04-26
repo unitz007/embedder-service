@@ -25,6 +25,8 @@ logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 import logging
 from typing import Any, List, Dict, Optional, Tuple
 
+import time
+
 import numpy as np
 import requests
 import torch
@@ -45,6 +47,11 @@ VOYAGE_API_URL = "https://api.voyageai.com/v1/embeddings"
 VOYAGE_MODEL = "voyage-code-3"
 VOYAGE_EMBEDDING_DIM = 1024
 VOYAGE_BATCH_SIZE = 128  # max texts per Voyage AI request
+
+# Retry configuration for Voyage AI API
+VOYAGE_MAX_RETRIES = 4
+VOYAGE_RETRY_BASE_DELAY = 1.0  # seconds; doubles on each retry
+VOYAGE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 # -------------------------------------------------------------------
@@ -509,7 +516,7 @@ class VoyageEmbedder:
         return self._encode_via_api(texts)
 
     def _encode_via_api(self, texts: List[str]) -> np.ndarray:
-        """Encode *texts* via the Voyage AI API (no cache lookup)."""
+        """Encode *texts* via the Voyage AI API with retry + exponential backoff."""
         if not texts:
             return np.empty((0, self._dim), dtype=np.float32)
 
@@ -517,35 +524,83 @@ class VoyageEmbedder:
 
         for i in range(0, len(texts), VOYAGE_BATCH_SIZE):
             batch = texts[i : i + VOYAGE_BATCH_SIZE]
-            payload = {
-                "model": VOYAGE_MODEL,
-                "input": batch,
-                "input_type": self.input_type,
-            }
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            }
-            resp = requests.post(
-                VOYAGE_API_URL,
-                json=payload,
-                headers=headers,
-                timeout=120,
-            )
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"Voyage AI API error {resp.status_code}: {resp.text}"
-                )
-            data = resp.json()["data"]
-            # data is a list of {"index": int, "embedding": List[float]}
-            # sort by index to preserve order
-            ordered = sorted(data, key=lambda x: x["index"])
-            batch_embeddings = np.array(
-                [item["embedding"] for item in ordered], dtype=np.float32
-            )
+            batch_embeddings = self._call_voyage_api(batch, batch_offset=i)
             all_embeddings.append(batch_embeddings)
 
         return np.vstack(all_embeddings)
+
+    def _call_voyage_api(self, batch: List[str], batch_offset: int = 0) -> np.ndarray:
+        """Call the Voyage AI API with retry and exponential backoff.
+
+        Retries on status codes 429, 500, 502, 503, 504.  Honours the
+        ``Retry-After`` header when present (429 responses).
+        """
+        payload = {
+            "model": VOYAGE_MODEL,
+            "input": batch,
+            "input_type": self.input_type,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(VOYAGE_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    VOYAGE_API_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=120,
+                )
+
+                if resp.status_code == 200:
+                    data = resp.json()["data"]
+                    ordered = sorted(data, key=lambda x: x["index"])
+                    return np.array(
+                        [item["embedding"] for item in ordered],
+                        dtype=np.float32,
+                    )
+
+                if resp.status_code not in VOYAGE_RETRY_STATUS_CODES:
+                    raise RuntimeError(
+                        f"Voyage AI API error {resp.status_code}: {resp.text}"
+                    )
+
+                # Retriable status — compute delay
+                last_exc = RuntimeError(
+                    f"Voyage AI API error {resp.status_code} (attempt {attempt + 1}/{VOYAGE_MAX_RETRIES + 1}): {resp.text}"
+                )
+
+                # Honour Retry-After header if present
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = float(retry_after)
+                    except ValueError:
+                        delay = VOYAGE_RETRY_BASE_DELAY * (2 ** attempt)
+                else:
+                    delay = VOYAGE_RETRY_BASE_DELAY * (2 ** attempt)
+
+                logger.warning(
+                    "Voyage AI API returned %d for batch offset %d — retrying in %.1fs (attempt %d/%d)",
+                    resp.status_code, batch_offset, delay, attempt + 1, VOYAGE_MAX_RETRIES + 1,
+                )
+                time.sleep(delay)
+
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                delay = VOYAGE_RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "Voyage AI API request failed for batch offset %d — retrying in %.1fs: %s",
+                    batch_offset, delay, exc,
+                )
+                time.sleep(delay)
+
+        raise RuntimeError(
+            f"Voyage AI API failed after {VOYAGE_MAX_RETRIES + 1} attempts for batch offset {batch_offset}: {last_exc}"
+        )
 
     def embed_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not chunks:

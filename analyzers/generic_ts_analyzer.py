@@ -233,12 +233,22 @@ def _load_parser(profile: LanguageProfile):
 # ---------------------------------------------------------------------------
 
 def _find_all(node, types: List[str]) -> List:
-    """Recursively collect all descendant nodes whose type is in `types`."""
+    """Iteratively collect all descendant nodes whose type is in `types`.
+
+    Uses an explicit stack instead of recursion to avoid hitting Python's
+    recursion limit on deeply nested ASTs (e.g. heavily nested C++ templates).
+    """
+    type_set = set(types)
     results = []
-    if node.type in types:
-        results.append(node)
-    for child in node.children:
-        results.extend(_find_all(child, types))
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type in type_set:
+            results.append(current)
+        # Extend with children — reversed so leftmost is processed first
+        children = current.children
+        if children:
+            stack.extend(reversed(children))
     return results
 
 
