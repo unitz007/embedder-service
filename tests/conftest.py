@@ -134,6 +134,8 @@ def sample_go_file(tmp_path):
     code = '''\
 package main
 
+import "database/sql"
+
 // APIVersion is the version of the API.
 const APIVersion = "v2"
 

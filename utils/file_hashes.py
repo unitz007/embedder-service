@@ -9,7 +9,6 @@ on subsequent indexing runs.
 import hashlib
 import json
 from pathlib import Path
-from typing import Optional
 
 
 def compute_file_hash(filepath: str) -> str:
