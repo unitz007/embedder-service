@@ -12,60 +12,6 @@ from models import FileAnalysis
 # Go analyzer tests
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def sample_go_file():
-    """Create a temporary Go source file and return its path."""
-    code = """\
-package main
-
-// APIVersion is the version of the API.
-const APIVersion = "v2"
-
-const DefaultTimeout = 30
-
-const (
-    MaxRetries    = 3
-    BaseURL       = "https://api.example.com"
-    AllowedMethods = "GET,POST"
-)
-
-var configPath string
-var configPath2 = "/etc/app/config.yaml"
-
-var (
-    port     = 8080
-    host     = "localhost"
-    debug    = true
-)
-
-// GetUser retrieves a user by ID.
-func GetUser(id int) (*User, error) {
-    return nil, nil
-}
-
-// Repo handles database operations.
-type Repo struct {
-    db *sql.DB
-}
-
-// Find returns a user from the database.
-func (r *Repo) Find(id int) (*User, error) {
-    return nil, nil
-}
-
-// Cache defines the caching interface.
-type Cache interface {
-    Get(key string) ([]byte, error)
-    Set(key string, val []byte) error
-}
-"""
-    fd, path = tempfile.mkstemp(suffix=".go")
-    with os.fdopen(fd, "w") as f:
-        f.write(code)
-    yield path
-    os.unlink(path)
-
-
 def test_go_basic(sample_go_file):
     result = analyze_go(sample_go_file)
     assert isinstance(result, FileAnalysis)
@@ -178,59 +124,14 @@ def test_go_variable_total_count(sample_go_file):
 # Python analyzer tests
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def sample_py_file():
-    code = """\
-\"\"\"Module docstring for test_module.\"\"\"
-
-MAX_CONNECTIONS = 100
-API_BASE_URL = "https://api.example.com"
-default_retry_count = 3
-
-class Config:
-    '''Configuration handler.'''
-
-    DEBUG = True
-    timeout: int = 30
-
-    def __init__(self, name: str):
-        self.name = name
-
-    def get_value(self, key: str) -> str:
-        return self.name
-
-    @classmethod
-    def from_env(cls) -> "Config":
-        return cls("default")
-
-    @staticmethod
-    def helper():
-        pass
-
-class BaseHandler:
-    pass
-
-def process(data: list) -> dict:
-    pass
-
-async def fetch(url: str) -> bytes:
-    pass
-"""
-    fd, path = tempfile.mkstemp(suffix=".py")
-    with os.fdopen(fd, "w") as f:
-        f.write(code)
-    yield path
-    os.unlink(path)
-
-
-def test_python_basic(sample_py_file):
-    result = analyze_python(sample_py_file)
+def test_python_basic(sample_python_file):
+    result = analyze_python(sample_python_file)
     assert isinstance(result, FileAnalysis)
     assert result.language == "python"
 
 
-def test_python_functions(sample_py_file):
-    result = analyze_python(sample_py_file)
+def test_python_functions(sample_python_file):
+    result = analyze_python(sample_python_file)
     names = [f.name for f in result.functions]
     assert "process" in names
     assert "fetch" in names
@@ -244,8 +145,8 @@ def test_python_functions(sample_py_file):
     assert process_fn.return_type == "dict"
 
 
-def test_python_classes(sample_py_file):
-    result = analyze_python(sample_py_file)
+def test_python_classes(sample_python_file):
+    result = analyze_python(sample_python_file)
     class_names = [c.name for c in result.classes]
     assert "Config" in class_names
     assert "BaseHandler" in class_names
@@ -255,13 +156,13 @@ def test_python_classes(sample_py_file):
     assert "Configuration handler" in config_cls.docstring
 
 
-def test_python_imports_empty(sample_py_file):
-    result = analyze_python(sample_py_file)
+def test_python_imports_empty(sample_python_file):
+    result = analyze_python(sample_python_file)
     assert result.imports == []
 
 
-def test_python_module_level_constants(sample_py_file):
-    result = analyze_python(sample_py_file)
+def test_python_module_level_constants(sample_python_file):
+    result = analyze_python(sample_python_file)
     vars_by_name = {v.name: v for v in result.variables}
 
     assert "MAX_CONNECTIONS" in vars_by_name
@@ -276,8 +177,8 @@ def test_python_module_level_constants(sample_py_file):
     assert "default_retry_count" not in vars_by_name
 
 
-def test_python_class_level_variables(sample_py_file):
-    result = analyze_python(sample_py_file)
+def test_python_class_level_variables(sample_python_file):
+    result = analyze_python(sample_python_file)
     vars_by_name = {v.name: v for v in result.variables}
 
     # ALL_CAPS class-level → const
@@ -294,9 +195,9 @@ def test_python_class_level_variables(sample_py_file):
     assert timeout_var.type_annotation == "int"
 
 
-def test_python_variable_total_count(sample_py_file):
+def test_python_variable_total_count(sample_python_file):
     """Module: MAX_CONNECTIONS, API_BASE_URL (2 consts). Class Config: DEBUG (const), timeout (class_var)."""
-    result = analyze_python(sample_py_file)
+    result = analyze_python(sample_python_file)
     assert len(result.variables) == 4
     consts = [v for v in result.variables if v.kind == "const"]
     class_vars = [v for v in result.variables if v.kind == "class_var"]
@@ -308,61 +209,14 @@ def test_python_variable_total_count(sample_py_file):
 # JavaScript analyzer tests
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def sample_js_file():
-    code = """\
-// API version constant
-const API_VERSION = "2.0";
-
-// Default configuration
-let config = {
-  host: "localhost",
-  port: 3000,
-};
-
-// Feature flags
-var debugMode = true;
-
-// Maximum retries allowed
-const MAX_RETRIES = 3;
-
-// This is an arrow function — should be a function, not a variable
-const fetchData = async (url) => {
-  const response = await fetch(url);
-  return response.json();
-};
-
-// This is a function expression — should be a function, not a variable
-const processData = function(data) {
-  return data.map(item => item.value);
-};
-
-// Regular function declaration
-function calculateTotal(items) {
-  return items.reduce((sum, item) => sum + item.price, 0);
-}
-
-// Named export with variable
-export const APP_NAME = "MyApp";
-
-// Array variable
-const ALLOWED_METHODS = ["GET", "POST", "PUT"];
-"""
-    fd, path = tempfile.mkstemp(suffix=".js")
-    with os.fdopen(fd, "w") as f:
-        f.write(code)
-    yield path
-    os.unlink(path)
-
-
-def test_js_basic(sample_js_file):
-    result = analyze_js(sample_js_file)
+def test_js_basic(sample_javascript_file):
+    result = analyze_js(sample_javascript_file)
     assert isinstance(result, FileAnalysis)
     assert result.language == "javascript"
 
 
-def test_js_functions(sample_js_file):
-    result = analyze_js(sample_js_file)
+def test_js_functions(sample_javascript_file):
+    result = analyze_js(sample_javascript_file)
     names = [f.name for f in result.functions]
     # Arrow function
     assert "fetchData" in names
@@ -373,8 +227,8 @@ def test_js_functions(sample_js_file):
     assert len(result.functions) == 3
 
 
-def test_js_variables(sample_js_file):
-    result = analyze_js(sample_js_file)
+def test_js_variables(sample_javascript_file):
+    result = analyze_js(sample_javascript_file)
     vars_by_name = {v.name: v for v in result.variables}
 
     # const API_VERSION
@@ -412,9 +266,9 @@ def test_js_variables(sample_js_file):
     assert "processData" not in vars_by_name
 
 
-def test_js_variable_total_count(sample_js_file):
+def test_js_variable_total_count(sample_javascript_file):
     """6 variables: API_VERSION, config, debugMode, MAX_RETRIES, APP_NAME, ALLOWED_METHODS."""
-    result = analyze_js(sample_js_file)
+    result = analyze_js(sample_javascript_file)
     assert len(result.variables) == 6
     consts = [v for v in result.variables if v.kind == "const"]
     lets = [v for v in result.variables if v.kind == "let"]
@@ -461,9 +315,9 @@ def test_chunker_variable_chunks_go(sample_go_file):
     assert "API version" in api_chunk["metadata"]["docstring"]
 
 
-def test_chunker_variable_chunks_js(sample_js_file):
+def test_chunker_variable_chunks_js(sample_javascript_file):
     """JS file with variables should produce variable chunks."""
-    result = analyze_js(sample_js_file)
+    result = analyze_js(sample_javascript_file)
     chunks = chunk_file_analysis(result)
 
     var_chunks = [c for c in chunks if c["type"] == "variable"]
@@ -493,9 +347,9 @@ def test_chunker_summary_includes_variables(sample_go_file):
     assert summary_chunk["metadata"]["variable_count"] == len(result.variables)
 
 
-def test_chunker_summary_includes_variables_js(sample_js_file):
+def test_chunker_summary_includes_variables_js(sample_javascript_file):
     """JS file summary should list variable names."""
-    result = analyze_js(sample_js_file)
+    result = analyze_js(sample_javascript_file)
     chunks = chunk_file_analysis(result)
 
     summary_chunk = next(c for c in chunks if c["type"] == "file_summary")
@@ -534,11 +388,11 @@ import sys
 from collections import OrderedDict
 
 def hello(name):
-    '''Say hello.'''
+    \'\'\'Say hello.\'\'\'
     print(name)
 
 class MyClass:
-    '''A test class.'''
+    \'\'\'A test class.\'\'\'
 
 def broken(
 """)  # SyntaxError: missing closing paren
@@ -570,7 +424,7 @@ def broken(
         assert "sys" in result.imports
         assert "collections" in result.imports
 
-        # No variables in fallback (regex fallback doesn't extract variables)
+        # No variables in fallback (regex fallback doesn\'t extract variables)
         assert result.variables == []
     finally:
         os.unlink(path)
@@ -616,7 +470,7 @@ def test_python_syntax_error_async_def():
 import asyncio
 
 async def fetch_data(url: str) -> bytes:
-    '''Fetch data from URL.'''
+    \'\'\'Fetch data from URL.\'\'\'
     pass
 
 def broken(
@@ -631,7 +485,7 @@ def broken(
 
 
 def test_python_syntax_error_import_recovery():
-    """Regex fallback recovers both 'import X' and 'from X import Y' statements."""
+    """Regex fallback recovers both \'import X\' and \'from X import Y\' statements."""
     fd, path = tempfile.mkstemp(suffix=".py")
     with os.fdopen(fd, "w") as f:
         f.write("""\

@@ -178,31 +178,3 @@ type Cache interface {
     path = tmp_path / "sample.go"
     path.write_text(code, encoding="utf-8")
     return str(path)
-
-
-@pytest.fixture
-def sample_shell_file(tmp_path):
-    """Create a temporary shell script with common constructs."""
-    code = '''\
-#!/usr/bin/env bash
-
-# Deploy the application
-deploy() {
-    echo "Deploying..."
-}
-
-# Print usage information
-usage() {
-    echo "Usage: $0 [options]"
-}
-
-alias ll='ls -la'
-
-export APP_PORT=3000
-export APP_HOST="localhost"
-
-source ./lib.sh
-'''
-    path = tmp_path / "sample.sh"
-    path.write_text(code, encoding="utf-8")
-    return str(path)
