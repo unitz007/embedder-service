@@ -35,3 +35,7 @@ tree-sitter-cpp
 tree-sitter-lua
 tree-sitter-bash
 tree-sitter-c-sharp
+
+# Testing
+pytest>=8.0.0
+pytest-cov>=4.0.0
