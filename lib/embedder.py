@@ -22,8 +22,7 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
-import logging
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -33,7 +32,6 @@ from sentence_transformers import SentenceTransformer
 
 import db as _db
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "microsoft/codebert-base"

@@ -3,7 +3,7 @@
 import ast
 import os
 import re
-from typing import List, Optional, Tuple
+from typing import List
 from models import FileAnalysis, FunctionInfo, ClassInfo, VariableInfo
 
 

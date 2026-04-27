@@ -4,10 +4,10 @@ import hashlib
 import json
 from typing import Any, Dict, List, Tuple
 
+import db
+
 import psycopg2
 from psycopg2.extras import execute_values
-
-import db
 
 
 def _chunk_id(meta: Dict[str, Any]) -> str:

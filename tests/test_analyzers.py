@@ -632,7 +632,7 @@ def broken(
 
 def test_python_syntax_error_import_recovery():
     """Regex fallback recovers both 'import X' and 'from X import Y' statements."""
-    fd, path = tempfile.mkstemp(suffix="..py")
+    fd, path = tempfile.mkstemp(suffix=".py")
     with os.fdopen(fd, "w") as f:
         f.write("""\
 import os

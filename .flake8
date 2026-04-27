@@ -1,0 +1,28 @@
+[flake8]
+max-line-length = 120
+exclude =
+    __pycache__,
+    .git,
+    .venv,
+    venv,
+    env,
+    node_modules,
+    build,
+    dist,
+    .tox,
+    fixtures,
+    migrations,
+    web,
+    *.egg-info,
+    .eggs,
+# Ignore common conventions that conflict with popular styles
+ignore =
+    E501,   # line too long (handled by max-line-length above)
+    W503,   # line break before binary operator
+    E402,   # module level import not at top of file
+    E702,   # multiple statements on one line (semicolon)
+per-file-ignores =
+    # Test files may use assert extensively, import for side effects, and have unused helpers
+    tests/*: E731,F401,F841
+    # __init__ files may have unused imports for re-export
+    __init__.py: F401,F403

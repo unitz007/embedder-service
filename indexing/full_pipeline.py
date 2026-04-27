@@ -21,7 +21,6 @@ from lib.embedder import (
     EMBEDDING_DIM,
     VOYAGE_EMBEDDING_DIM,
     VOYAGE_MODEL,
-    DEFAULT_MODEL,
 )
 from lib.graph import (
     build_import_graph, enrich_chunks_with_graph,

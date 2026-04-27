@@ -32,10 +32,9 @@ import shutil
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import chromadb
 
 try:
-
+    import chromadb  # noqa: F401
     CHROMA_AVAILABLE = True
 except ImportError:
     CHROMA_AVAILABLE = False
@@ -298,10 +297,10 @@ class ChromaStore:
     def get_total_vectors(self) -> int:
         return self._col.count()
 
-    def save(self, filepath: str) -> None:
+    def save(self, _filepath: str) -> None:
         """No-op — Chroma auto-persists to disk on every write."""
 
-    def load(self, filepath: str) -> None:
+    def load(self, _filepath: str) -> None:
         """No-op — data is already loaded from persist_dir in __init__."""
 
     # ------------------------------------------------------------------

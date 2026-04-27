@@ -1,9 +1,7 @@
 """Tests for utils/file_scanner — scan_repository()."""
 
 import os
-import stat
 import tempfile
-import textwrap
 import pytest
 
 from utils.file_scanner import (

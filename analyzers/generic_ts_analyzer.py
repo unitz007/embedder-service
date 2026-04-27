@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from models import FileAnalysis, FunctionInfo, ClassInfo, VariableInfo
 
@@ -367,7 +367,7 @@ def _is_var_node_interesting(node, profile: LanguageProfile) -> bool:
     return True
 
 
-import re  # noqa: E402 (needed for _get_leading_doc)
+import re
 
 
 # ---------------------------------------------------------------------------

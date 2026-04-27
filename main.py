@@ -227,28 +227,11 @@ def process_zip(temp_dir, zip_path, namespace, project_id, job_id):
 
         repo_root = get_repo_root(extract_path)
 
-        store, call_graph, import_graph, index_meta = full_pipeline_pgvector(
+        store, _call_graph, _import_graph, index_meta = full_pipeline_pgvector(
             repo_path=repo_root,
             namespace=namespace,
             project_id=project_id,
         )
-        db.upsert_index_meta(namespace, project_id, index_meta)
-
-        job = _job_update(
-            job_id,
-            status="completed",
-            total_vectors=store.get_total_vectors(),
-            persist_dir="pgvector",
-            embedder=index_meta.get("embedder"),
-        )
-        _notify_webhook(job)
-    except Exception as e:
-        job = _job_update(job_id, status="failed", error=str(e))
-        _notify_webhook(job)
-        raise
-
-
-@app.get("/")
 def read_root():
     return FileResponse(os.path.join(os.path.dirname(__file__), "web", "index.html"))
 
@@ -434,7 +417,7 @@ def embed_text(req: EmbedRequest):
 def _process_local_path(repo_path: str, namespace: str, project_id: str, job_id: str):
     try:
         _job_update(job_id, status="running")
-        store, call_graph, import_graph, index_meta = full_pipeline_pgvector(
+        store, _call_graph, _import_graph, index_meta = full_pipeline_pgvector(
             repo_path=repo_path,
             namespace=namespace,
             project_id=project_id,
